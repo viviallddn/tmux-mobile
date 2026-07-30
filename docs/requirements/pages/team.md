@@ -31,8 +31,8 @@ server. See `docs/design-docs/features/team.md` for architecture.
   auto-migrated). Schema: optional **team-wide** `env` / `mcp` / `skills` /
   `prompt` (applied to every agent) plus `agents:[{ name, backend, role, goal,
   model, manage, env?, mcp?, skills? }]`. Built-ins (`default`, `software-dev`,
-  `financial-research`, `deep-research`, `content-studio`, `data-analysis`) are
-  seeded on first run.
+  `financial-research`, `deep-research`, `product-strategy`,
+  `content-studio`, `data-analysis`) are seeded on first run.
 - The new-team panel picks which template to use (with a folder browser that can
   create + select a new workspace folder).
 - An **editor** (edit button beside the picker) adds/renames/deletes templates

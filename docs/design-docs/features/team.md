@@ -344,7 +344,8 @@ reference.)
 
 A team definition is a **folder** `~/.config/tmux-mobile/teams/<name>/` holding a
 `team.yaml` (the roster + per-agent config) and optionally a `skills/` dir of
-local skills. The built-ins (`default`, `software-dev`, `financial-research`)
+local skills. The built-ins (`default`, `software-dev`, `financial-research`,
+`deep-research`, `product-strategy`, `content-studio`, `data-analysis`)
 ship the same shape in `team/templates/<name>/team.yaml`, embedded via
 `include_str!` and seeded once into the config dir (user edits never overwritten).
 The folder — not a flat file — is the unit so a team can carry its own assets.

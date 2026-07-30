@@ -76,6 +76,12 @@ pub const FINANCIAL_RESEARCH_TEMPLATE: &str =
 /// report.md.
 pub const DEEP_RESEARCH_TEMPLATE: &str = include_str!("../../team/templates/deep-research/team.yaml");
 
+/// A product-strategy roster inspired by the think-tank workflow: lead,
+/// independent research lanes, roadmap synthesis, adversarial challenge, and
+/// evidence/risk audit for product evolution and iteration direction.
+pub const PRODUCT_STRATEGY_TEMPLATE: &str =
+    include_str!("../../team/templates/product-strategy/team.yaml");
+
 /// A content-studio roster (editor-in-chief / researcher / writer / copy editor)
 /// for shipping a publish-ready article or docs in a shared house style.
 pub const CONTENT_STUDIO_TEMPLATE: &str = include_str!("../../team/templates/content-studio/team.yaml");
@@ -90,6 +96,7 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("software-dev", SOFTWARE_DEV_TEMPLATE),
     ("financial-research", FINANCIAL_RESEARCH_TEMPLATE),
     ("deep-research", DEEP_RESEARCH_TEMPLATE),
+    ("product-strategy", PRODUCT_STRATEGY_TEMPLATE),
     ("content-studio", CONTENT_STUDIO_TEMPLATE),
     ("data-analysis", DATA_ANALYSIS_TEMPLATE),
 ];
@@ -1577,7 +1584,15 @@ mod tests {
         ensure_templates_seeded();
         let mut names = list_templates();
         names.sort();
-        for expected in ["default", "software-dev", "financial-research", "deep-research", "content-studio", "data-analysis"] {
+        for expected in [
+            "default",
+            "software-dev",
+            "financial-research",
+            "deep-research",
+            "product-strategy",
+            "content-studio",
+            "data-analysis",
+        ] {
             assert!(names.contains(&expected.to_string()), "{expected} seeded: {names:?}");
         }
 
@@ -1611,6 +1626,34 @@ mod tests {
         assert!(
             agents.iter().all(|a| a["goal"].as_str().map(|g| g.len() > 80).unwrap_or(false)),
             "each role's goal must carry its methodology"
+        );
+    }
+
+    #[test]
+    fn product_strategy_template_matches_think_tank_shape() {
+        let v: Value = serde_yml::from_str(PRODUCT_STRATEGY_TEMPLATE).unwrap();
+        assert!(v["prompt"].as_str().unwrap_or("").contains("product strategy think tank"));
+        let agents = v["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 8, "lead + 4 research/synthesis lanes + challenge + audit");
+        let names: Vec<&str> = agents.iter().filter_map(|a| a["name"].as_str()).collect();
+        for expected in [
+            "lead",
+            "user_researcher",
+            "market_researcher",
+            "methodology",
+            "capability",
+            "synthesist",
+            "challenger",
+            "auditor",
+        ] {
+            assert!(names.contains(&expected), "missing role '{expected}': {names:?}");
+        }
+        let managers = agents.iter().filter(|a| a["manage"] == true).count();
+        assert_eq!(managers, 0, "hire/fire off: no manage=true agent");
+        assert!(agents.iter().all(|a| a["model"] == ""), "models use the server default");
+        assert!(
+            agents.iter().all(|a| a["goal"].as_str().map(|g| g.len() > 80).unwrap_or(false)),
+            "each role's goal must carry its product-strategy method"
         );
     }
 

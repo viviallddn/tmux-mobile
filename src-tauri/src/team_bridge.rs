@@ -9,23 +9,25 @@
 //!
 //! Compiled ONLY on desktop (lib.rs `#[cfg(...)]`); mobile passes `None`.
 
-use crate::team::{self, TeamConfig};
 use crate::server::TeamBridge;
+use crate::team::{self, TeamConfig};
 use agora::bus::{Bus, BusProvider};
 use agora::store::SharedConn;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::broadcast;
 
 const SESSION_PREFIX: &str = "tmm-team-";
+const RECENT_WORKSPACE_LIMIT: usize = 20;
 
 /// One live team: its bus + launch metadata.
 struct Team {
     bus: Bus,
     workspace: String,
-    template: String,  // roster template this team was started from
-    session: String,   // tmm-team-<room>
-    started: bool,     // supervisor launched for this room
+    template: String,                  // roster template this team was started from
+    session: String,                   // tmm-team-<room>
+    started: bool,                     // supervisor launched for this room
     pump: tokio::task::JoinHandle<()>, // the Message→JSON re-broadcast task
 }
 
@@ -40,13 +42,29 @@ pub struct TeamManager {
     cfg: TeamConfig,
     /// Where room→workspace is persisted so restarts can recover teams.
     meta_path: std::path::PathBuf,
+    /// Recently started workspaces, kept separate from the recovery map so
+    /// closing a team does not erase the user's one-click start history.
+    recent_path: std::path::PathBuf,
     self_ref: OnceLock<Weak<TeamManager>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecentWorkspace {
+    workspace: String,
+    template: String,
+    room: String,
+    last_started: i64,
 }
 
 impl TeamManager {
     /// Open the store, start the MCP/dashboard daemon (room-aware), and recover
     /// any teams still running in tmux from a previous run.
-    pub fn start(db: &str, _room: &str, bind: &str, model: &str) -> Result<Arc<TeamManager>, Box<dyn std::error::Error>> {
+    pub fn start(
+        db: &str,
+        _room: &str,
+        bind: &str,
+        model: &str,
+    ) -> Result<Arc<TeamManager>, Box<dyn std::error::Error>> {
         // Write the built-in default roster template if the teams/ dir is empty,
         // so the user always has something to pick + edit.
         team::ensure_templates_seeded();
@@ -70,6 +88,10 @@ impl TeamManager {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("teams.json");
+        let recent_path = std::path::Path::new(db)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("team_workspaces.json");
 
         let me = Arc::new(TeamManager {
             conn,
@@ -77,6 +99,7 @@ impl TeamManager {
             json_tx,
             cfg,
             meta_path,
+            recent_path,
             self_ref: OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -85,7 +108,10 @@ impl TeamManager {
         // itself (room-aware). Bind failure is non-fatal — the phone path still
         // works in-process.
         {
-            println!("🜂 team manager ready (db {}); MCP + dashboard → http://{}/", db, bind);
+            println!(
+                "🜂 team manager ready (db {}); MCP + dashboard → http://{}/",
+                db, bind
+            );
             let provider: Arc<dyn BusProvider> = me.clone();
             let bind = bind.to_string();
             tokio::spawn(async move {
@@ -116,6 +142,7 @@ impl TeamManager {
             if self.ensure_room(&room, &workspace, &template).is_err() {
                 continue;
             }
+            self.remember_workspace(&workspace, &template, &room);
             // Mark started + relaunch the reconcile loop, which ADOPTS the
             // existing agent windows (preserving each agent's conversation
             // context + in-flight work) rather than reopening them.
@@ -130,7 +157,10 @@ impl TeamManager {
                 // but can't unstick themselves. Nudge each window to reconnect
                 // (Esc the dead call + re-prompt). One-shot, off the hot path.
                 team::nudge_session_agents(session.clone());
-                println!("🜂 team: recovered running team '{}' (adopting + nudging agents)", room);
+                println!(
+                    "🜂 team: recovered running team '{}' (adopting + nudging agents)",
+                    room
+                );
             }
         }
     }
@@ -144,8 +174,16 @@ impl TeamManager {
         let mut map = HashMap::new();
         if let Some(obj) = v.as_object() {
             for (room, entry) in obj {
-                let ws = entry.get("workspace").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let tpl = entry.get("template").and_then(|x| x.as_str()).unwrap_or("default").to_string();
+                let ws = entry
+                    .get("workspace")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tpl = entry
+                    .get("template")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("default")
+                    .to_string();
                 map.insert(room.clone(), (ws, tpl));
             }
         }
@@ -159,11 +197,101 @@ impl TeamManager {
             .lock()
             .unwrap()
             .iter()
-            .map(|(room, t)| (room.clone(), serde_json::json!({ "workspace": t.workspace, "template": t.template })))
+            .map(|(room, t)| {
+                (
+                    room.clone(),
+                    serde_json::json!({ "workspace": t.workspace, "template": t.template }),
+                )
+            })
             .collect();
         if let Ok(s) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
             let _ = std::fs::write(&self.meta_path, s);
         }
+    }
+
+    fn load_recent_workspaces(&self) -> Vec<RecentWorkspace> {
+        let v: serde_json::Value = std::fs::read_to_string(&self.recent_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let arr = if let Some(arr) = v.get("recent_workspaces").and_then(|x| x.as_array()) {
+            arr.clone()
+        } else if let Some(arr) = v.as_array() {
+            arr.clone()
+        } else {
+            Vec::new()
+        };
+        let mut recent = Vec::new();
+        for item in arr {
+            let workspace = item
+                .get("workspace")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if workspace.is_empty() {
+                continue;
+            }
+            let template = item
+                .get("template")
+                .and_then(|x| x.as_str())
+                .unwrap_or("default")
+                .trim();
+            let room = item
+                .get("room")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| team::workspace_slug(&workspace));
+            recent.push(RecentWorkspace {
+                workspace,
+                template: if template.is_empty() {
+                    "default".to_string()
+                } else {
+                    template.to_string()
+                },
+                room,
+                last_started: item
+                    .get("last_started")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0),
+            });
+        }
+        recent.sort_by(|a, b| b.last_started.cmp(&a.last_started));
+        recent.truncate(RECENT_WORKSPACE_LIMIT);
+        recent
+    }
+
+    fn save_recent_workspaces(&self, recent: &[RecentWorkspace]) {
+        let payload = serde_json::json!({ "recent_workspaces": recent });
+        if let Ok(s) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(&self.recent_path, s);
+        }
+    }
+
+    fn remember_workspace(&self, workspace: &str, template: &str, room: &str) {
+        let ws = workspace.trim();
+        if ws.is_empty() {
+            return;
+        }
+        let tpl = if template.trim().is_empty() {
+            "default"
+        } else {
+            template.trim()
+        };
+        let mut recent = self.load_recent_workspaces();
+        recent.retain(|item| item.workspace != ws);
+        recent.insert(
+            0,
+            RecentWorkspace {
+                workspace: ws.to_string(),
+                template: tpl.to_string(),
+                room: room.to_string(),
+                last_started: chrono_ms(),
+            },
+        );
+        recent.truncate(RECENT_WORKSPACE_LIMIT);
+        self.save_recent_workspaces(&recent);
     }
 
     /// Get an existing room's bus, or register it over the shared connection and
@@ -209,7 +337,11 @@ impl TeamManager {
                 Team {
                     bus: bus.clone(),
                     workspace: workspace.to_string(),
-                    template: if template.is_empty() { "default".to_string() } else { template.to_string() },
+                    template: if template.is_empty() {
+                        "default".to_string()
+                    } else {
+                        template.to_string()
+                    },
                     session: format!("{}{}", SESSION_PREFIX, room),
                     started: false,
                     pump,
@@ -224,6 +356,30 @@ impl TeamManager {
     fn room_bus(&self, room: &str) -> Option<Bus> {
         self.teams.lock().unwrap().get(room).map(|t| t.bus.clone())
     }
+
+    fn next_clone_room(&self, source_room: &str) -> String {
+        let base = format!("{}-clone", source_room.trim_matches('-'));
+        let teams = self.teams.lock().unwrap();
+        for n in 1..1000 {
+            let room = if n == 1 {
+                base.clone()
+            } else {
+                format!("{}-{}", base, n)
+            };
+            let session = format!("{}{}", SESSION_PREFIX, room);
+            if !teams.contains_key(&room) && !crate::tmux::session_exists(&session) {
+                return room;
+            }
+        }
+        format!("{}-{}", base, chrono_ms())
+    }
+}
+
+fn chrono_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // The manager IS the MCP/web room provider: agents' `x-room` header selects a
@@ -248,34 +404,68 @@ impl BusProvider for TeamManager {
 
 impl TeamBridge for TeamManager {
     fn history(&self, room: &str, limit: i64) -> serde_json::Value {
-        let msgs = self.room_bus(room).and_then(|b| b.history(limit).ok()).unwrap_or_default();
+        let msgs = self
+            .room_bus(room)
+            .and_then(|b| b.history(limit).ok())
+            .unwrap_or_default();
         serde_json::json!({ "messages": msgs })
     }
 
     fn roster(&self, room: &str) -> serde_json::Value {
-        let roster = self.room_bus(room).and_then(|b| b.roster().ok()).unwrap_or_default();
+        let roster = self
+            .room_bus(room)
+            .and_then(|b| b.roster().ok())
+            .unwrap_or_default();
         serde_json::json!({ "roster": roster })
     }
 
-    fn post(&self, room: &str, from: &str, body: &str, requires_reply: bool) -> Result<serde_json::Value, String> {
-        let bus = self.room_bus(room).ok_or_else(|| format!("unknown team '{room}'"))?;
+    fn post(
+        &self,
+        room: &str,
+        from: &str,
+        body: &str,
+        requires_reply: bool,
+    ) -> Result<serde_json::Value, String> {
+        let bus = self
+            .room_bus(room)
+            .ok_or_else(|| format!("unknown team '{room}'"))?;
         bus.post(from, body, requires_reply)
             .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
             .map_err(|e| e.to_string())
     }
 
     fn set_agent_status(&self, room: &str, agent: &str, status: &str) -> Result<(), String> {
-        let bus = self.room_bus(room).ok_or_else(|| format!("unknown team '{room}'"))?;
+        let bus = self
+            .room_bus(room)
+            .ok_or_else(|| format!("unknown team '{room}'"))?;
         bus.set_status(agent, status).map_err(|e| e.to_string())
     }
 
     fn employees(&self, room: &str) -> serde_json::Value {
-        let employees = self.room_bus(room).and_then(|b| b.employees().ok()).unwrap_or_default();
+        let employees = self
+            .room_bus(room)
+            .and_then(|b| b.employees().ok())
+            .unwrap_or_default();
         serde_json::json!({ "employees": employees })
     }
 
-    fn seed_employee(&self, room: &str, name: &str, spec: &serde_json::Value) -> Result<(), String> {
-        let bus = self.room_bus(room).ok_or_else(|| format!("unknown team '{room}'"))?;
+    fn usage(&self, room: &str) -> serde_json::Value {
+        let usage = self
+            .room_bus(room)
+            .and_then(|b| b.usage().ok())
+            .unwrap_or_default();
+        serde_json::json!({ "usage": usage })
+    }
+
+    fn seed_employee(
+        &self,
+        room: &str,
+        name: &str,
+        spec: &serde_json::Value,
+    ) -> Result<(), String> {
+        let bus = self
+            .room_bus(room)
+            .ok_or_else(|| format!("unknown team '{room}'"))?;
         bus.seed_employee(name, spec).map_err(|e| e.to_string())
     }
 
@@ -293,8 +483,16 @@ impl TeamBridge for TeamManager {
     }
 
     fn start_team(&self, workspace: &str, template: &str) -> serde_json::Value {
-        let ws = if workspace.trim().is_empty() { self.default_workspace() } else { workspace.trim().to_string() };
-        let tpl = if template.trim().is_empty() { "default".to_string() } else { template.trim().to_string() };
+        let ws = if workspace.trim().is_empty() {
+            self.default_workspace()
+        } else {
+            workspace.trim().to_string()
+        };
+        let tpl = if template.trim().is_empty() {
+            "default".to_string()
+        } else {
+            template.trim().to_string()
+        };
         let room = team::workspace_slug(&ws);
 
         // Self-heal the built-in templates (the teams/ dir may have been deleted)
@@ -316,7 +514,9 @@ impl TeamBridge for TeamManager {
                 Some(t) => {
                     let was = t.started;
                     t.started = true;
-                    if !was { t.template = tpl.clone(); }
+                    if !was {
+                        t.template = tpl.clone();
+                    }
                     was
                 }
                 None => false,
@@ -335,15 +535,134 @@ impl TeamBridge for TeamManager {
             }
         }
         self.save_meta();
+        self.remember_workspace(&ws, &tpl, &room);
         match self.self_ref.get().and_then(|w| w.upgrade()) {
             Some(arc) => {
                 let bridge: Arc<dyn TeamBridge> = arc;
-                team::start(bridge, self.cfg.clone(), room.clone(), ws.clone(), tpl.clone());
+                team::start(
+                    bridge,
+                    self.cfg.clone(),
+                    room.clone(),
+                    ws.clone(),
+                    tpl.clone(),
+                );
                 serde_json::json!({ "started": true, "room": room, "workspace": ws, "template": tpl })
             }
             None => {
-                if let Some(t) = self.teams.lock().unwrap().get_mut(&room) { t.started = false; }
+                if let Some(t) = self.teams.lock().unwrap().get_mut(&room) {
+                    t.started = false;
+                }
                 serde_json::json!({ "started": false, "room": room, "workspace": ws, "error": "manager gone" })
+            }
+        }
+    }
+
+    fn clone_team(&self, room: &str) -> serde_json::Value {
+        let (workspace, template) = {
+            let teams = self.teams.lock().unwrap();
+            match teams.get(room) {
+                Some(t) => (t.workspace.clone(), t.template.clone()),
+                None => {
+                    return serde_json::json!({
+                        "started": false,
+                        "cloned_from": room,
+                        "error": format!("unknown team '{}'", room),
+                    });
+                }
+            }
+        };
+        let source_specs = self.employee_specs(room);
+        if source_specs.is_empty() && team::read_template(&template).is_empty() {
+            return serde_json::json!({
+                "started": false,
+                "cloned_from": room,
+                "workspace": workspace,
+                "template": template,
+                "error": "source team has no roster to clone",
+            });
+        }
+
+        let new_room = self.next_clone_room(room);
+        if let Err(e) = self.ensure_room(&new_room, &workspace, &template) {
+            return serde_json::json!({
+                "started": false,
+                "room": new_room,
+                "cloned_from": room,
+                "workspace": workspace,
+                "template": template,
+                "error": e,
+            });
+        }
+        if let Some(bus) = self.room_bus(&new_room) {
+            if let Err(e) = bus.reset_room() {
+                eprintln!("⚠️  team: reset clone room '{}' failed: {}", new_room, e);
+            }
+        }
+
+        let mut seeded = 0usize;
+        let mut seed_errors = Vec::new();
+        for (name, spec, state) in &source_specs {
+            if state == "disabled" {
+                continue;
+            }
+            match self.seed_employee(&new_room, name, spec) {
+                Ok(()) => seeded += 1,
+                Err(e) => seed_errors.push(format!("{}: {}", name, e)),
+            }
+        }
+        if !source_specs.is_empty() && seeded == 0 {
+            let _ = self.close_team(&new_room);
+            return serde_json::json!({
+                "started": false,
+                "room": new_room,
+                "cloned_from": room,
+                "workspace": workspace,
+                "template": template,
+                "error": format!("failed to clone roster: {}", seed_errors.join("; ")),
+            });
+        }
+
+        {
+            let mut teams = self.teams.lock().unwrap();
+            if let Some(t) = teams.get_mut(&new_room) {
+                t.started = true;
+            }
+        }
+        self.save_meta();
+        self.remember_workspace(&workspace, &template, &new_room);
+
+        match self.self_ref.get().and_then(|w| w.upgrade()) {
+            Some(arc) => {
+                let bridge: Arc<dyn TeamBridge> = arc;
+                team::start(
+                    bridge,
+                    self.cfg.clone(),
+                    new_room.clone(),
+                    workspace.clone(),
+                    template.clone(),
+                );
+                serde_json::json!({
+                    "started": true,
+                    "room": new_room,
+                    "cloned_from": room,
+                    "workspace": workspace,
+                    "template": template,
+                    "agents": seeded,
+                    "seed_errors": seed_errors,
+                })
+            }
+            None => {
+                if let Some(t) = self.teams.lock().unwrap().get_mut(&new_room) {
+                    t.started = false;
+                }
+                serde_json::json!({
+                    "started": false,
+                    "room": new_room,
+                    "cloned_from": room,
+                    "workspace": workspace,
+                    "template": template,
+                    "error": "manager gone",
+                })
             }
         }
     }
@@ -355,7 +674,9 @@ impl TeamBridge for TeamManager {
         };
         match removed {
             Some(t) => {
-                t.pump.abort(); // stop the re-broadcast task (no leak / no dup on reopen)
+                self.remember_workspace(&t.workspace, &t.template, room);
+                // Stop the re-broadcast task (no leak / no dup on reopen).
+                t.pump.abort();
                 // Kill the tmux session (best-effort), then forget the team's
                 // persisted state so a future start on the same workspace begins
                 // clean. (A backend restart resumes a LIVE team via recovery,
@@ -375,7 +696,11 @@ impl TeamBridge for TeamManager {
         let list: Vec<serde_json::Value> = teams
             .values()
             .map(|t| {
-                let agents = t.bus.roster().map(|r| r.iter().filter(|a| a.status != "offline").count()).unwrap_or(0);
+                let agents = t
+                    .bus
+                    .roster()
+                    .map(|r| r.iter().filter(|a| a.status != "offline").count())
+                    .unwrap_or(0);
                 serde_json::json!({
                     "room": t.session.strip_prefix(SESSION_PREFIX).unwrap_or(&t.session),
                     "workspace": t.workspace,
@@ -415,6 +740,10 @@ impl TeamBridge for TeamManager {
             .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
     }
 
+    fn recent_workspaces(&self) -> serde_json::Value {
+        serde_json::json!({ "recent_workspaces": self.load_recent_workspaces() })
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<String> {
         self.json_tx.subscribe()
     }
@@ -430,8 +759,11 @@ mod tests {
     fn manager() -> Arc<TeamManager> {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir()
-            .join(format!("teamtest-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "teamtest-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok();
         let db = dir.join("team.db").to_string_lossy().into_owned();
@@ -441,8 +773,14 @@ mod tests {
             conn,
             teams: Mutex::new(HashMap::new()),
             json_tx,
-            cfg: TeamConfig { url: "http://127.0.0.1:0".into(), model: "m".into(), team_rules: String::new(), team_kick: String::new() },
+            cfg: TeamConfig {
+                url: "http://127.0.0.1:0".into(),
+                model: "m".into(),
+                team_rules: String::new(),
+                team_kick: String::new(),
+            },
             meta_path: dir.join("teams.json"),
+            recent_path: dir.join("team_workspaces.json"),
             self_ref: OnceLock::new(),
         });
         let _ = me.self_ref.set(Arc::downgrade(&me));
@@ -471,14 +809,28 @@ mod tests {
 
         let a = m.history("alpha", 100);
         let b = m.history("beta", 100);
-        let a_bodies: Vec<String> = a["messages"].as_array().unwrap().iter()
-            .map(|x| x["body"].as_str().unwrap_or("").to_string()).collect();
-        let b_bodies: Vec<String> = b["messages"].as_array().unwrap().iter()
-            .map(|x| x["body"].as_str().unwrap_or("").to_string()).collect();
+        let a_bodies: Vec<String> = a["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["body"].as_str().unwrap_or("").to_string())
+            .collect();
+        let b_bodies: Vec<String> = b["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["body"].as_str().unwrap_or("").to_string())
+            .collect();
         assert!(a_bodies.iter().any(|s| s == "hello alpha"));
-        assert!(!a_bodies.iter().any(|s| s == "hello beta"), "beta leaked into alpha");
+        assert!(
+            !a_bodies.iter().any(|s| s == "hello beta"),
+            "beta leaked into alpha"
+        );
         assert!(b_bodies.iter().any(|s| s == "hello beta"));
-        assert!(!b_bodies.iter().any(|s| s == "hello alpha"), "alpha leaked into beta");
+        assert!(
+            !b_bodies.iter().any(|s| s == "hello alpha"),
+            "alpha leaked into beta"
+        );
     }
 
     #[tokio::test]
@@ -488,14 +840,33 @@ mod tests {
         let m = manager();
         m.ensure_room("alpha", "/tmp/alpha", "default").unwrap();
         let bus = m.room_bus("alpha").unwrap();
-        bus.seed_employee("manager", &serde_json::json!({ "role": "manager" })).unwrap();
+        bus.seed_employee("manager", &serde_json::json!({ "role": "manager" }))
+            .unwrap();
         m.post("alpha", "human", "hello", false).unwrap();
-        assert!(!m.employees("alpha")["employees"].as_array().unwrap().is_empty());
-        assert!(!m.history("alpha", 100)["messages"].as_array().unwrap().is_empty());
+        assert!(!m.employees("alpha")["employees"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!m.history("alpha", 100)["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         bus.reset_room().unwrap();
-        assert!(m.employees("alpha")["employees"].as_array().unwrap().is_empty(), "employees cleared");
-        assert!(m.history("alpha", 100)["messages"].as_array().unwrap().is_empty(), "log cleared");
+        assert!(
+            m.employees("alpha")["employees"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "employees cleared"
+        );
+        assert!(
+            m.history("alpha", 100)["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "log cleared"
+        );
     }
 
     #[tokio::test]
@@ -507,5 +878,21 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["room"], "alpha");
         assert_eq!(arr[0]["workspace"], "/tmp/alpha");
+    }
+
+    #[tokio::test]
+    async fn recent_workspaces_survive_close() {
+        let m = manager();
+        m.ensure_room("alpha", "/tmp/alpha", "software-dev")
+            .unwrap();
+        m.remember_workspace("/tmp/alpha", "software-dev", "alpha");
+        assert_eq!(m.close_team("alpha"), true);
+
+        let recent = m.recent_workspaces();
+        let arr = recent["recent_workspaces"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["workspace"], "/tmp/alpha");
+        assert_eq!(arr[0]["template"], "software-dev");
+        assert_eq!(arr[0]["room"], "alpha");
     }
 }

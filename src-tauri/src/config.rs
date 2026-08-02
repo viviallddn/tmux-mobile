@@ -165,7 +165,9 @@ fn load_or_create_machine_id() -> String {
     let path = dirs_next().join("machine_id");
     if let Ok(id) = std::fs::read_to_string(&path) {
         let id = id.trim().to_string();
-        if !id.is_empty() { return id; }
+        if !id.is_empty() {
+            return id;
+        }
     }
     let id = uuid::Uuid::new_v4().to_string();
     let _ = std::fs::create_dir_all(dirs_next());
@@ -238,8 +240,8 @@ mod tests {
 
     fn mkfile(mode: u32) -> std::path::PathBuf {
         let n = TEST_CTR.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir()
-            .join(format!("tmux_mobile_cfg_test_{}_{}", std::process::id(), n));
+        let p =
+            std::env::temp_dir().join(format!("tmux_mobile_cfg_test_{}_{}", std::process::id(), n));
         std::fs::write(&p, b"token = \"x\"\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         p
@@ -305,10 +307,11 @@ pub fn get_prefs() -> serde_json::Value {
 pub fn set_prefs(key: &str, value: serde_json::Value) -> Result<(), String> {
     let dir = dirs_next();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut prefs: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(prefs_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let mut prefs: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(prefs_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
     prefs.insert(key.to_string(), value);
     let json = serde_json::to_string_pretty(&prefs).map_err(|e| e.to_string())?;
     std::fs::write(prefs_path(), json).map_err(|e| e.to_string())
@@ -391,8 +394,12 @@ fn append_config_field(key: &str, value: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("config.toml");
     let mut content = std::fs::read_to_string(&path).unwrap_or_default();
-    if content.contains(key) { return Ok(()); }
-    if !content.is_empty() && !content.ends_with('\n') { content.push('\n'); }
+    if content.contains(key) {
+        return Ok(());
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
     // Multi-line string: use TOML triple-quoted literal.
     content.push_str(&format!("{} = '''\n{}'''\n", key, value));
     std::fs::write(&path, content)

@@ -82,9 +82,16 @@ pub struct Obligation {
 pub enum WaitOutcome {
     /// Refused: reply to these agents before you may wait. `pending` re-surfaces the
     /// actual unanswered @-messages so you know exactly what to respond to.
-    Blocked { you_owe: Vec<String>, pending: Vec<Message> },
+    Blocked {
+        you_owe: Vec<String>,
+        pending: Vec<Message>,
+    },
     /// New messages delivered; roster included so you needn't list agents separately.
-    Delivered { messages: Vec<Message>, roster: Vec<AgentRow>, cursor: i64 },
+    Delivered {
+        messages: Vec<Message>,
+        roster: Vec<AgentRow>,
+        cursor: i64,
+    },
     /// Nothing arrived within the timeout; you remain waiting.
     Idle { roster: Vec<AgentRow>, cursor: i64 },
 }
@@ -108,7 +115,11 @@ pub struct JoinResult {
 impl Bus {
     pub fn new(conn: rusqlite::Connection, room: impl Into<String>) -> Self {
         let (tx, _rx) = broadcast::channel(1024);
-        Bus { conn: Arc::new(Mutex::new(conn)), tx, room: room.into() }
+        Bus {
+            conn: Arc::new(Mutex::new(conn)),
+            tx,
+            room: room.into(),
+        }
     }
 
     /// Build a room-scoped bus over a connection SHARED with other rooms. All
@@ -118,7 +129,11 @@ impl Bus {
     /// channel (per-room live wakeups); isolation stays at the `room` column.
     pub fn with_shared(conn: Arc<Mutex<rusqlite::Connection>>, room: impl Into<String>) -> Self {
         let (tx, _rx) = broadcast::channel(1024);
-        Bus { conn, tx, room: room.into() }
+        Bus {
+            conn,
+            tx,
+            room: room.into(),
+        }
     }
 
     pub fn room(&self) -> &str {
@@ -149,7 +164,14 @@ impl Bus {
                     Some(r) => format!("{name} joined as {r}."),
                     None => format!("{name} joined."),
                 };
-                Some(store::append(&conn, &self.room, name, &[], Kind::Join, &body)?)
+                Some(store::append(
+                    &conn,
+                    &self.room,
+                    name,
+                    &[],
+                    Kind::Join,
+                    &body,
+                )?)
             } else {
                 None
             };
@@ -159,15 +181,29 @@ impl Bus {
         if let Some(m) = join_msg {
             let _ = self.tx.send(m);
         }
-        Ok(JoinResult { cursor, fresh, roster: apply_presence(roster) })
+        Ok(JoinResult {
+            cursor,
+            fresh,
+            roster: apply_presence(roster),
+        })
     }
 
     /// Resolve a `to` list into concrete recipient names (expanding all/* to the
     /// roster), excluding the sender itself.
-    fn resolve_recipients(&self, conn: &rusqlite::Connection, from: &str, to: &[String]) -> Result<Vec<String>> {
-        let all = to.iter().any(|t| ALL_TOKENS.contains(&t.to_ascii_lowercase().as_str()));
+    fn resolve_recipients(
+        &self,
+        conn: &rusqlite::Connection,
+        from: &str,
+        to: &[String],
+    ) -> Result<Vec<String>> {
+        let all = to
+            .iter()
+            .any(|t| ALL_TOKENS.contains(&t.to_ascii_lowercase().as_str()));
         let names: Vec<String> = if all {
-            store::roster(conn, &self.room)?.into_iter().map(|a| a.name).collect()
+            store::roster(conn, &self.room)?
+                .into_iter()
+                .map(|a| a.name)
+                .collect()
         } else {
             to.to_vec()
         };
@@ -230,7 +266,9 @@ impl Bus {
     /// idle while you still owe someone a reply.
     pub async fn wait(&self, agent: &str, timeout: Option<Duration>) -> Result<WaitOutcome> {
         let mut rx = self.tx.subscribe();
-        let budget = timeout.unwrap_or(Duration::from_millis(MAX_WAIT_MS)).min(Duration::from_millis(MAX_WAIT_MS));
+        let budget = timeout
+            .unwrap_or(Duration::from_millis(MAX_WAIT_MS))
+            .min(Duration::from_millis(MAX_WAIT_MS));
         let deadline = Instant::now() + budget;
 
         loop {
@@ -245,13 +283,18 @@ impl Bus {
             let (delivered, roster, report_cursor) = {
                 let conn = self.lock();
                 store::touch(&conn, &self.room, agent).ok();
-                let cursor = store::get_agent(&conn, &self.room, agent)?.map(|a| a.cursor).unwrap_or(0);
+                let cursor = store::get_agent(&conn, &self.room, agent)?
+                    .map(|a| a.cursor)
+                    .unwrap_or(0);
                 let batch = store::messages_after(&conn, &self.room, cursor, 500)?;
                 let max_seq = batch.last().map(|m| m.seq).unwrap_or(cursor);
                 let roster = apply_presence(store::roster(&conn, &self.room)?);
-                let is_agent = |name: &str| roster.iter().any(|a| a.name.eq_ignore_ascii_case(name));
-                let foreign: Vec<Message> =
-                    batch.into_iter().filter(|m| !m.from.eq_ignore_ascii_case(agent)).collect();
+                let is_agent =
+                    |name: &str| roster.iter().any(|a| a.name.eq_ignore_ascii_case(name));
+                let foreign: Vec<Message> = batch
+                    .into_iter()
+                    .filter(|m| !m.from.eq_ignore_ascii_case(agent))
+                    .collect();
                 // Worth waking for: addressed to me (@me/@all), or a human message.
                 let triggered = foreign.iter().any(|m| {
                     m.addresses(agent) || (matches!(m.kind, Kind::Msg) && !is_agent(&m.from))
@@ -277,7 +320,11 @@ impl Bus {
                 // Just received message(s) — about to process them, quick reply
                 // expected. The first tool/heartbeat promotes this to `working`.
                 store::set_status(&conn, &self.room, agent, "thinking")?;
-                return Ok(WaitOutcome::Delivered { messages: delivered, roster, cursor: report_cursor });
+                return Ok(WaitOutcome::Delivered {
+                    messages: delivered,
+                    roster,
+                    cursor: report_cursor,
+                });
             }
 
             // 2. Caught up: refuse to go idle while you owe someone a reply, and
@@ -301,7 +348,10 @@ impl Bus {
             // 3. Nothing to do and nothing owed: park until a new message or the timeout.
             let now = Instant::now();
             if now >= deadline {
-                return Ok(WaitOutcome::Idle { roster, cursor: report_cursor });
+                return Ok(WaitOutcome::Idle {
+                    roster,
+                    cursor: report_cursor,
+                });
             }
             let nap = (deadline - now).min(Duration::from_millis(POLL_INTERVAL_MS));
             tokio::select! {
@@ -320,10 +370,40 @@ impl Bus {
     /// while it is heads-down on a turn). It both refreshes `last_seen` AND marks
     /// the agent `working` — sustained tool activity is exactly what distinguishes
     /// `working` from the brief `thinking` window right after a message arrives.
-    /// No-op (Ok) if the agent has no roster row yet.
-    pub fn heartbeat(&self, agent: &str) -> Result<()> {
-        let conn = self.lock();
-        store::set_status(&conn, &self.room, agent, "working")
+    ///
+    /// A first heartbeat also joins the roster. This covers startup paths where
+    /// the CLI prompt hook fires before the model successfully calls `wait`.
+    pub fn heartbeat(&self, agent: &str, role: Option<&str>) -> Result<()> {
+        let join_msg = {
+            let conn = self.lock();
+            let (_, fresh) = store::upsert_agent(&conn, &self.room, agent, role)?;
+            if let Some(e) = store::get_employee(&conn, &self.room, agent)? {
+                if e.state == "requested" {
+                    store::set_employee_state(&conn, &self.room, agent, "active")?;
+                }
+            }
+            store::set_status(&conn, &self.room, agent, "working")?;
+            if fresh {
+                let body = match role {
+                    Some(r) => format!("{agent} joined as {r}."),
+                    None => format!("{agent} joined."),
+                };
+                Some(store::append(
+                    &conn,
+                    &self.room,
+                    agent,
+                    &[],
+                    Kind::Join,
+                    &body,
+                )?)
+            } else {
+                None
+            }
+        };
+        if let Some(m) = join_msg {
+            let _ = self.tx.send(m);
+        }
+        Ok(())
     }
 
     /// Force an agent's stored status. Used by the supervisor's idle-sleep:
@@ -358,7 +438,8 @@ impl Bus {
             "role": responsibility, "goal": responsibility, "backstory": "", "manage": false,
         });
         self.seed_employee(name, &spec)?;
-        let body = format!("🆕 {manager} hired **{name}** (role: {responsibility}). Coming online…");
+        let body =
+            format!("🆕 {manager} hired **{name}** (role: {responsibility}). Coming online…");
         let msg = {
             let conn = self.lock();
             store::append(&conn, &self.room, "system", &[], Kind::System, &body)?
@@ -413,6 +494,23 @@ impl Bus {
         store::list_employees(&conn, &self.room)
     }
 
+    /// Record the latest token counters for an agent. The payload shape is
+    /// deliberately backend-neutral; hooks normalize Claude/Codex before
+    /// posting to `/api/usage`.
+    pub fn record_usage(
+        &self,
+        agent: &str,
+        payload: &serde_json::Value,
+    ) -> Result<crate::store::UsageSnapshot> {
+        let conn = self.lock();
+        store::upsert_usage(&conn, &self.room, agent, payload)
+    }
+
+    pub fn usage(&self) -> Result<Vec<crate::store::UsageSnapshot>> {
+        let conn = self.lock();
+        store::usage(&conn, &self.room)
+    }
+
     /// Forget all persisted state for this room (messages, roster, obligations,
     /// employees). For an explicit (re)start or close of a team — NOT recovery,
     /// which adopts a still-running team and its log as-is.
@@ -436,7 +534,10 @@ impl Bus {
             Ok(Quiescence::Done)
         } else {
             Ok(Quiescence::Deadlock {
-                open: obs.into_iter().map(|(debtor, creditor)| Obligation { debtor, creditor }).collect(),
+                open: obs
+                    .into_iter()
+                    .map(|(debtor, creditor)| Obligation { debtor, creditor })
+                    .collect(),
             })
         }
     }
@@ -507,7 +608,10 @@ fn raw_mentions_creditor(body: &str, creditor: &str) -> bool {
 /// `all`/`*` token). Used so writing "@manager" in a message addresses manager, the
 /// same as passing it in `to`. Only ASCII `[A-Za-z0-9_-]` names are matched.
 fn mentioned_names(conn: &rusqlite::Connection, room: &str, body: &str) -> Result<Vec<String>> {
-    let mut known: Vec<String> = store::roster(conn, room)?.into_iter().map(|a| a.name).collect();
+    let mut known: Vec<String> = store::roster(conn, room)?
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
     for e in store::list_employees(conn, room)? {
         if !known.iter().any(|k| k.eq_ignore_ascii_case(&e.name)) {
             known.push(e.name);
@@ -546,7 +650,6 @@ fn mentioned_names(conn: &rusqlite::Connection, room: &str, body: &str) -> Resul
     Ok(out)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,22 +669,34 @@ mod tests {
     #[test]
     fn presence_overlay_is_tiered() {
         let out = apply_presence(vec![
-            row("worker", "working", 1_000),                  // heartbeating → keep
-            row("ponderer", "thinking", 5_000),               // just got a msg → keep
-            row("parked", "idle", 5_000),                     // touched recently → keep
-            row("grinding", "working", STALE_TTL_MS + 10_000),// silent → hardworking
-            row("crashed", "idle", STALE_TTL_MS + 10_000),    // parked but stale = loop died → stalled
-            row("wedged", "working", STALLED_TTL_MS + 10_000),// silent 30min+ → stalled
-            row("left", "offline", STALLED_TTL_MS + 10_000),  // explicit → stays offline
+            row("worker", "working", 1_000),    // heartbeating → keep
+            row("ponderer", "thinking", 5_000), // just got a msg → keep
+            row("parked", "idle", 5_000),       // touched recently → keep
+            row("grinding", "working", STALE_TTL_MS + 10_000), // silent → hardworking
+            row("crashed", "idle", STALE_TTL_MS + 10_000), // parked but stale = loop died → stalled
+            row("wedged", "working", STALLED_TTL_MS + 10_000), // silent 30min+ → stalled
+            row("left", "offline", STALLED_TTL_MS + 10_000), // explicit → stays offline
         ]);
         let by = |n: &str| out.iter().find(|a| a.name == n).unwrap().status.clone();
         assert_eq!(by("worker"), "working");
         assert_eq!(by("ponderer"), "thinking");
         assert_eq!(by("parked"), "idle");
-        assert_eq!(by("grinding"), "hardworking", "stale in-turn agent is head-down, not removed");
-        assert_eq!(by("crashed"), "stalled", "a parked agent that stops touching has a dead loop");
+        assert_eq!(
+            by("grinding"),
+            "hardworking",
+            "stale in-turn agent is head-down, not removed"
+        );
+        assert_eq!(
+            by("crashed"),
+            "stalled",
+            "a parked agent that stops touching has a dead loop"
+        );
         assert_eq!(by("wedged"), "stalled");
-        assert_eq!(by("left"), "offline", "explicit offline is never relabelled");
+        assert_eq!(
+            by("left"),
+            "offline",
+            "explicit offline is never relabelled"
+        );
     }
 
     #[test]

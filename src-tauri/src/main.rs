@@ -7,13 +7,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tmux_mobile::tmux;
 
     const TEST_SESSION: &str = "_tmux_mobile_test";
 
     fn cleanup() {
         let _ = tmux::kill_session(TEST_SESSION);
+    }
+
+    fn wait_for_capture(target: &str, lines: Option<usize>, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            last = tmux::capture_pane(target, lines).expect("Failed to capture pane");
+            if last.contains(needle) {
+                return last;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        last
     }
 
     #[test]
@@ -120,9 +133,7 @@ mod tests {
             "for i in $(seq 1 100); do echo \"line_$i\"; done",
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(1000));
-
-        let output = tmux::capture_pane(TEST_SESSION, Some(50)).unwrap();
+        let output = wait_for_capture(TEST_SESSION, Some(50), "line_100");
         assert!(output.contains("line_100"), "Should capture line_100");
         println!("✅ Scrollback capture works");
         cleanup();

@@ -12,7 +12,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio_tungstenite::{accept_async_with_config, tungstenite::Message, tungstenite::protocol::WebSocketConfig};
+use tokio_tungstenite::{
+    accept_async_with_config, tungstenite::protocol::WebSocketConfig, tungstenite::Message,
+};
 
 // ─── Wire framing for the encrypted binary path ──────────────────────────
 // Encrypted messages now travel as WebSocket BINARY frames. The first byte
@@ -49,14 +51,23 @@ pub trait TeamBridge: Send + Sync {
     /// Roster + presence for `room`: `{ "roster": [...] }`.
     fn roster(&self, room: &str) -> serde_json::Value;
     /// Post as a participant in `room`. Returns the stored message JSON.
-    fn post(&self, room: &str, from: &str, body: &str, requires_reply: bool) -> Result<serde_json::Value, String>;
+    fn post(
+        &self,
+        room: &str,
+        from: &str,
+        body: &str,
+        requires_reply: bool,
+    ) -> Result<serde_json::Value, String>;
     /// Force an agent's stored status in `room` (supervisor idle-sleep:
     /// `"sleeping"` to park, `"idle"` to wake). No-op if the agent is unknown.
     fn set_agent_status(&self, room: &str, agent: &str, status: &str) -> Result<(), String>;
     /// Desired-roster employees for `room`: `{ "employees": [...] }`.
     fn employees(&self, room: &str) -> serde_json::Value;
+    /// Token-usage snapshots for `room`: `{ "usage": [...] }`.
+    fn usage(&self, room: &str) -> serde_json::Value;
     /// Seed an employee into `room`'s desired roster (used by the supervisor).
-    fn seed_employee(&self, room: &str, name: &str, spec: &serde_json::Value) -> Result<(), String>;
+    fn seed_employee(&self, room: &str, name: &str, spec: &serde_json::Value)
+        -> Result<(), String>;
     /// Raw employee list for `room` as `(name, spec, state)` for the
     /// supervisor's reconcile loop.
     fn employee_specs(&self, room: &str) -> Vec<(String, serde_json::Value, String)>;
@@ -68,6 +79,10 @@ pub trait TeamBridge: Send + Sync {
     /// agents into a per-workspace tmux session. Idempotent per room. Returns
     /// `{ room, started, workspace }`.
     fn start_team(&self, workspace: &str, template: &str) -> serde_json::Value;
+    /// Clone an existing team into a new room/session. The clone keeps the same
+    /// workspace/template and copies the current desired roster, but starts with
+    /// a fresh chat log and independent agent processes.
+    fn clone_team(&self, room: &str) -> serde_json::Value;
     /// Stop a team: kill its tmux session and forget it (the chat log persists
     /// in the db). Returns true if the room was known.
     fn close_team(&self, room: &str) -> bool;
@@ -86,6 +101,9 @@ pub trait TeamBridge: Send + Sync {
     /// The default workspace to offer in the UI when none is chosen (the
     /// current terminal session's cwd if known, else the user's home).
     fn default_workspace(&self) -> String;
+    /// Recently started team workspaces for one-click recreation:
+    /// `{ "recent_workspaces": [{ workspace, template, room, last_started }] }`.
+    fn recent_workspaces(&self) -> serde_json::Value;
     /// A receiver of newly-broadcast messages across ALL rooms, each
     /// pre-serialized to a JSON string (the `room` field is inside each
     /// message). The client filters to the team currently in view.
@@ -144,8 +162,13 @@ fn sign_download(token: &str, path: &str, ts: u64) -> String {
 }
 
 fn verify_download(token: &str, path: &str, ts: u64, sig: &str) -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    if now.saturating_sub(ts) > DL_TOKEN_TTL_SECS { return false; }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if now.saturating_sub(ts) > DL_TOKEN_TTL_SECS {
+        return false;
+    }
     sign_download(token, path, ts) == sig
 }
 
@@ -231,7 +254,10 @@ pub fn encode_wire_payload(json: &str) -> Vec<u8> {
     }
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
-    let mut enc = DeflateEncoder::new(Vec::with_capacity(bytes.len() / 4 + 32), Compression::fast());
+    let mut enc = DeflateEncoder::new(
+        Vec::with_capacity(bytes.len() / 4 + 32),
+        Compression::fast(),
+    );
     // write_all + finish() never fail on a Vec writer.
     enc.write_all(bytes).expect("deflate write to Vec");
     let compressed = enc.finish().expect("deflate finish");
@@ -254,17 +280,19 @@ pub fn encode_wire_payload(json: &str) -> Vec<u8> {
 /// rarely runs in production server, but keeping the inverse handy keeps
 /// the protocol symmetric.
 pub fn decode_wire_payload(buf: &[u8]) -> Result<String, String> {
-    let (&tag, body) = buf.split_first().ok_or_else(|| "empty wire payload".to_string())?;
+    let (&tag, body) = buf
+        .split_first()
+        .ok_or_else(|| "empty wire payload".to_string())?;
     match tag {
-        WIRE_PLAIN_JSON => {
-            String::from_utf8(body.to_vec()).map_err(|e| format!("plain wire payload not utf-8: {}", e))
-        }
+        WIRE_PLAIN_JSON => String::from_utf8(body.to_vec())
+            .map_err(|e| format!("plain wire payload not utf-8: {}", e)),
         WIRE_DEFLATE_JSON => {
             use flate2::read::DeflateDecoder;
             use std::io::Read;
             let mut dec = DeflateDecoder::new(body);
             let mut out = String::with_capacity(body.len() * 4);
-            dec.read_to_string(&mut out).map_err(|e| format!("inflate failed: {}", e))?;
+            dec.read_to_string(&mut out)
+                .map_err(|e| format!("inflate failed: {}", e))?;
             Ok(out)
         }
         other => Err(format!("unknown wire framing tag: 0x{:02x}", other)),
@@ -294,19 +322,25 @@ struct HalfCipher {
 
 impl HalfCipher {
     fn new(key: &[u8; 32]) -> Self {
-        Self { cipher: Aes256Gcm::new_from_slice(key).unwrap(), counter: 0 }
+        Self {
+            cipher: Aes256Gcm::new_from_slice(key).unwrap(),
+            counter: 0,
+        }
     }
     fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..].copy_from_slice(&self.counter.to_be_bytes());
         self.counter += 1;
-        self.cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext).unwrap()
+        self.cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .unwrap()
     }
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..].copy_from_slice(&self.counter.to_be_bytes());
         self.counter += 1;
-        self.cipher.decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
+        self.cipher
+            .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
             .map_err(|_| "decryption failed".to_string())
     }
 }
@@ -440,10 +474,13 @@ fn handle_request(req: &Request, token: &str) -> Response {
                 Ok(v) => v,
                 Err(e) => return Response::err(id, ERR_INTERNAL, e),
             };
-            Response::ok(id, serde_json::json!({
-                "sessions": sessions,
-                "panes": panes,
-            }))
+            Response::ok(
+                id,
+                serde_json::json!({
+                    "sessions": sessions,
+                    "panes": panes,
+                }),
+            )
         }
 
         "capture_pane" => {
@@ -576,9 +613,7 @@ fn handle_request(req: &Request, token: &str) -> Response {
             }
         }
 
-        "get_prefs" => {
-            Response::ok(id, crate::config::get_prefs())
-        }
+        "get_prefs" => Response::ok(id, crate::config::get_prefs()),
 
         "set_pref" => {
             let key = match require_str(p, "key") {
@@ -710,10 +745,21 @@ fn handle_request(req: &Request, token: &str) -> Response {
                 Ok(s) => s,
                 Err(e) => return Response::err(id, ERR_INVALID_PARAMS, e),
             };
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let sig = sign_download(token, path, ts);
-            let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file");
-            let qs = format!("/dl?path={}&ts={}&sig={}", urlencoding::encode(path), ts, sig);
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            let qs = format!(
+                "/dl?path={}&ts={}&sig={}",
+                urlencoding::encode(path),
+                ts,
+                sig
+            );
             Response::ok(id, serde_json::json!({ "url": qs, "name": name }))
         }
 
@@ -740,20 +786,43 @@ fn handle_request(req: &Request, token: &str) -> Response {
             let args: Vec<String> = p
                 .get("args")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let cwd = p.get("cwd").and_then(|v| v.as_str());
 
             const ALLOWED: &[&str] = &[
-                "status", "diff", "log", "show", "branch", "rev-parse", "push", "add", "commit", "restore",
+                "status",
+                "diff",
+                "log",
+                "show",
+                "branch",
+                "rev-parse",
+                "push",
+                "add",
+                "commit",
+                "restore",
             ];
             if !ALLOWED.contains(&subcmd) {
-                return Response::err(id, ERR_INVALID_PARAMS, format!("git subcommand not allowed: {}", subcmd));
+                return Response::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    format!("git subcommand not allowed: {}", subcmd),
+                );
             }
             // Reject args containing shell metacharacters
             for arg in &args {
-                if arg.contains(|c: char| matches!(c, ';' | '&' | '$' | '`' | '|' | '>' | '<' | '\n' | '\r')) {
-                    return Response::err(id, ERR_INVALID_PARAMS, "invalid characters in argument".into());
+                if arg.contains(|c: char| {
+                    matches!(c, ';' | '&' | '$' | '`' | '|' | '>' | '<' | '\n' | '\r')
+                }) {
+                    return Response::err(
+                        id,
+                        ERR_INVALID_PARAMS,
+                        "invalid characters in argument".into(),
+                    );
                 }
             }
 
@@ -785,7 +854,11 @@ fn handle_request(req: &Request, token: &str) -> Response {
             if format != "html" {
                 return Response::err(id, ERR_INVALID_PARAMS, "only html format supported".into());
             }
-            let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            let ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
             let script = match ext.as_str() {
                 "pptx" => r#"import sys,pptx,html as h;p=pptx.Presentation(sys.argv[1]);o=""
 for i,s in enumerate(p.slides):
@@ -804,7 +877,12 @@ for i,s in enumerate(p.slides):
 print(o)"#.to_string(),
                 _ => return Response::err(id, ERR_INVALID_PARAMS, format!("unsupported file type: .{}", ext)),
             };
-            match std::process::Command::new("python3").arg("-c").arg(&script).arg(path).output() {
+            match std::process::Command::new("python3")
+                .arg("-c")
+                .arg(&script)
+                .arg(path)
+                .output()
+            {
                 Ok(output) => {
                     if output.status.success() {
                         let html = String::from_utf8_lossy(&output.stdout).to_string();
@@ -832,7 +910,8 @@ async fn subscription_loop(
     subs: Subscriptions,
     snapshots_inflight: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(SUBSCRIPTION_POLL_MS));
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_millis(SUBSCRIPTION_POLL_MS));
     let mut fail_counts: HashMap<String, u32> = HashMap::new();
     loop {
         interval.tick().await;
@@ -854,40 +933,48 @@ async fn subscription_loop(
         for (target, prev) in targets {
             let t = target.clone();
             let t2 = target.clone();
-            let (new_content, cursor, trailing_trimmed, current_cmd) = match tokio::task::spawn_blocking(move || {
-                // Get cursor first for pane width, then capture content immediately after
-                // to minimize race window between the two tmux calls
-                let info = tmux::cursor_info_with_cmd(&t2).unwrap_or((0, 0, 24, 80, String::new()));
-                let (content, trailing) = tmux::capture_pane_with_width(&t, None, info.3)?;
-                // Re-read cursor to get position matching the captured content.
-                // Reuse the previous current_cmd — its value rarely flips
-                // mid-tick and one tmux call is cheaper than two.
-                let info2 = tmux::cursor_info_with_cmd(&t2).unwrap_or(info.clone());
-                Ok::<_, String>((content, (info2.0, info2.1, info2.2, info2.3), trailing, info2.4))
-            })
-            .await
-            {
-                Ok(Ok(v)) => {
-                    fail_counts.remove(&target);
-                    v
-                }
-                _ => {
-                    let count = fail_counts.entry(target.clone()).or_insert(0);
-                    *count += 1;
-                    if *count >= MAX_CAPTURE_FAILURES {
-                        subs.lock().await.remove(&target);
+            let (new_content, cursor, trailing_trimmed, current_cmd) =
+                match tokio::task::spawn_blocking(move || {
+                    // Get cursor first for pane width, then capture content immediately after
+                    // to minimize race window between the two tmux calls
+                    let info =
+                        tmux::cursor_info_with_cmd(&t2).unwrap_or((0, 0, 24, 80, String::new()));
+                    let (content, trailing) = tmux::capture_pane_with_width(&t, None, info.3)?;
+                    // Re-read cursor to get position matching the captured content.
+                    // Reuse the previous current_cmd — its value rarely flips
+                    // mid-tick and one tmux call is cheaper than two.
+                    let info2 = tmux::cursor_info_with_cmd(&t2).unwrap_or(info.clone());
+                    Ok::<_, String>((
+                        content,
+                        (info2.0, info2.1, info2.2, info2.3),
+                        trailing,
+                        info2.4,
+                    ))
+                })
+                .await
+                {
+                    Ok(Ok(v)) => {
                         fail_counts.remove(&target);
-                        // Notify client that pane is gone
-                        let msg = serde_json::json!({
-                            "id": null,
-                            "method": "pane_closed",
-                            "params": { "target": target }
-                        });
-                        let _ = out_tx.send(Outbound::Encrypted(serde_json::to_string(&msg).unwrap()));
+                        v
                     }
-                    continue;
-                }
-            };
+                    _ => {
+                        let count = fail_counts.entry(target.clone()).or_insert(0);
+                        *count += 1;
+                        if *count >= MAX_CAPTURE_FAILURES {
+                            subs.lock().await.remove(&target);
+                            fail_counts.remove(&target);
+                            // Notify client that pane is gone
+                            let msg = serde_json::json!({
+                                "id": null,
+                                "method": "pane_closed",
+                                "params": { "target": target }
+                            });
+                            let _ = out_tx
+                                .send(Outbound::Encrypted(serde_json::to_string(&msg).unwrap()));
+                        }
+                        continue;
+                    }
+                };
             // state_key is only used for change detection; including the
             // current command makes "command changed but content didn't"
             // (rare but possible: `clear` + new shell prompt) a real diff.
@@ -898,11 +985,9 @@ async fn subscription_loop(
             if state_key == prev {
                 continue;
             }
-            subs.lock()
-                .await
-                .insert(target.clone(), state_key);
-            let content_changed = !prev.is_empty()
-                && prev.split('\x00').next().unwrap_or("") != new_content;
+            subs.lock().await.insert(target.clone(), state_key);
+            let content_changed =
+                !prev.is_empty() && prev.split('\x00').next().unwrap_or("") != new_content;
             // Detect command changes by comparing the third \x00-delimited
             // segment. Empty `prev` means first push → always include cmd.
             let prev_cmd = prev.split('\x00').nth(2).unwrap_or("");
@@ -918,7 +1003,10 @@ async fn subscription_loop(
             }
             params.insert("cursor".into(), cursor_obj);
             if cmd_changed {
-                params.insert("current_command".into(), serde_json::Value::String(current_cmd));
+                params.insert(
+                    "current_command".into(),
+                    serde_json::Value::String(current_cmd),
+                );
             }
             let msg = serde_json::json!({
                 "id": null,
@@ -929,7 +1017,10 @@ async fn subscription_loop(
             // frame hits the socket, so the counter can never be observed
             // at 0 while a snapshot is actually pending.
             snapshots_inflight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            if out_tx.send(Outbound::Snapshot(serde_json::to_string(&msg).unwrap())).is_err() {
+            if out_tx
+                .send(Outbound::Snapshot(serde_json::to_string(&msg).unwrap()))
+                .is_err()
+            {
                 snapshots_inflight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 return; // receiver has shut down
             }
@@ -944,7 +1035,11 @@ fn handle_team_request(req: &Request, team: Option<&dyn TeamBridge>) -> Response
     let id = req.id;
     let p = &req.params;
     let Some(bus) = team else {
-        return Response::err(id, ERR_METHOD_NOT_FOUND, "team bus not available on this server".into());
+        return Response::err(
+            id,
+            ERR_METHOD_NOT_FOUND,
+            "team bus not available on this server".into(),
+        );
     };
     // Most methods operate on a specific team `room` (the phone's active team).
     let room = p.get("room").and_then(|v| v.as_str()).unwrap_or("");
@@ -952,13 +1047,17 @@ fn handle_team_request(req: &Request, team: Option<&dyn TeamBridge>) -> Response
         // Bus availability + the team list + a default workspace to pre-fill.
         // Team-agnostic, so the Team tab can render the switcher before picking
         // an active room.
-        "team_status" => Response::ok(id, serde_json::json!({
-            "available": true,
-            "teams": bus.teams().get("teams").cloned().unwrap_or(serde_json::json!([])),
-            "templates": bus.templates().get("templates").cloned().unwrap_or(serde_json::json!([])),
-            "system_prompt": bus.system_prompt(),
-            "default_workspace": bus.default_workspace(),
-        })),
+        "team_status" => Response::ok(
+            id,
+            serde_json::json!({
+                "available": true,
+                "teams": bus.teams().get("teams").cloned().unwrap_or(serde_json::json!([])),
+                "templates": bus.templates().get("templates").cloned().unwrap_or(serde_json::json!([])),
+                "system_prompt": bus.system_prompt(),
+                "default_workspace": bus.default_workspace(),
+                "recent_workspaces": bus.recent_workspaces().get("recent_workspaces").cloned().unwrap_or(serde_json::json!([])),
+            }),
+        ),
         "team_teams" => Response::ok(id, bus.teams()),
         // Global system prompt (prepended to every agent's brief).
         "team_system_prompt_save" => {
@@ -995,31 +1094,59 @@ fn handle_team_request(req: &Request, team: Option<&dyn TeamBridge>) -> Response
             }
         }
         "team_history" => {
-            let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(100).clamp(1, 1000);
+            let limit = p
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(100)
+                .clamp(1, 1000);
             Response::ok(id, bus.history(room, limit))
         }
         "team_roster" => Response::ok(id, bus.roster(room)),
         "team_employees" => Response::ok(id, bus.employees(room)),
+        "team_usage" => Response::ok(id, bus.usage(room)),
         // Operator action: spin up a team in `workspace` from `template` (its
         // room = the workspace slug). Idempotent; returns { room, started, workspace }.
         "team_start_team" => {
-            let workspace = p.get("workspace").and_then(|v| v.as_str())
+            let workspace = p
+                .get("workspace")
+                .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| bus.default_workspace());
-            let template = p.get("template").and_then(|v| v.as_str()).unwrap_or("default");
+            let template = p
+                .get("template")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
             Response::ok(id, bus.start_team(&workspace, template))
+        }
+        "team_clone_team" => {
+            if room.is_empty() {
+                return Response::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    "missing required param: room".into(),
+                );
+            }
+            Response::ok(id, bus.clone_team(room))
         }
         // Stop a team: kill its tmux session, forget it (chat log persists).
         "team_close_team" => {
             if room.is_empty() {
-                return Response::err(id, ERR_INVALID_PARAMS, "missing required param: room".into());
+                return Response::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    "missing required param: room".into(),
+                );
             }
             Response::ok(id, serde_json::json!({ "closed": bus.close_team(room) }))
         }
         "team_post" => {
             if room.is_empty() {
-                return Response::err(id, ERR_INVALID_PARAMS, "missing required param: room".into());
+                return Response::err(
+                    id,
+                    ERR_INVALID_PARAMS,
+                    "missing required param: room".into(),
+                );
             }
             let body = match require_str(p, "body") {
                 Ok(s) => s,
@@ -1028,7 +1155,11 @@ fn handle_team_request(req: &Request, team: Option<&dyn TeamBridge>) -> Response
             // The human is "you" on the phone; default sender name "human"
             // matches team's dashboard/CLI convention so the operator shows
             // up consistently across surfaces.
-            let from = p.get("from").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("human");
+            let from = p
+                .get("from")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("human");
             // Mirror the dashboard: an @mention implies a reply is wanted
             // unless the client says otherwise.
             let requires_reply = p
@@ -1040,14 +1171,21 @@ fn handle_team_request(req: &Request, team: Option<&dyn TeamBridge>) -> Response
                 Err(e) => Response::err(id, ERR_INTERNAL, e),
             }
         }
-        other => Response::err(id, ERR_METHOD_NOT_FOUND, format!("unknown team method: {}", other)),
+        other => Response::err(
+            id,
+            ERR_METHOD_NOT_FOUND,
+            format!("unknown team method: {}", other),
+        ),
     }
 }
 
 /// Push newly-broadcast team messages to this client as `team_message`
 /// notifications, so the Team tab updates live without polling. Mirrors the
 /// dashboard's SSE stream, but rides the existing encrypted Outbound channel.
-async fn team_push_loop(out_tx: tokio::sync::mpsc::UnboundedSender<Outbound>, team: Arc<dyn TeamBridge>) {
+async fn team_push_loop(
+    out_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
+    team: Arc<dyn TeamBridge>,
+) {
     let mut rx = team.subscribe();
     loop {
         match rx.recv().await {
@@ -1057,7 +1195,10 @@ async fn team_push_loop(out_tx: tokio::sync::mpsc::UnboundedSender<Outbound>, te
                     "method": "team_message",
                     "params": { "message": serde_json::from_str::<serde_json::Value>(&msg_json).unwrap_or(serde_json::Value::Null) },
                 });
-                if out_tx.send(Outbound::Encrypted(serde_json::to_string(&frame).unwrap())).is_err() {
+                if out_tx
+                    .send(Outbound::Encrypted(serde_json::to_string(&frame).unwrap()))
+                    .is_err()
+                {
                     return; // send task gone
                 }
             }
@@ -1105,7 +1246,9 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 /// allowed to ignore Range and answer 200 with the full body).
 fn parse_range_start(req: &str) -> Option<u64> {
     for line in req.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if !k.trim().eq_ignore_ascii_case("range") {
             continue;
         }
@@ -1173,20 +1316,25 @@ where
         Some(i) => &url_part[i + 4..],
         None => "",
     };
-    let params: HashMap<&str, &str> = query.split('&')
-        .filter_map(|p| p.split_once('='))
-        .collect();
+    let params: HashMap<&str, &str> = query.split('&').filter_map(|p| p.split_once('=')).collect();
 
     let path = match params.get("path") {
         Some(p) => urlencoding::decode(p).unwrap_or_default().to_string(),
-        None => { let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").await; return; }
+        None => {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
     };
     let ts: u64 = params.get("ts").and_then(|s| s.parse().ok()).unwrap_or(0);
     let sig = params.get("sig").unwrap_or(&"");
 
     if !verify_download(&token, &path, ts, sig) {
         eprintln!("🚫 HTTP download rejected for {} (invalid sig)", addr);
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .await;
         let _ = stream.flush().await;
         return;
     }
@@ -1196,12 +1344,17 @@ where
     let metadata = match std::fs::metadata(file_path) {
         Ok(m) => m,
         Err(_) => {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await;
             let _ = stream.flush().await;
             return;
         }
     };
-    let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
     let size = metadata.len();
 
     // Range support: lets the client RESUME an interrupted transfer instead
@@ -1225,7 +1378,9 @@ where
             name, size
         ),
     };
-    if stream.write_all(header.as_bytes()).await.is_err() { return; }
+    if stream.write_all(header.as_bytes()).await.is_err() {
+        return;
+    }
 
     // Stream file in chunks
     let mut file = match tokio::fs::File::open(&path).await {
@@ -1244,14 +1399,25 @@ where
             Ok(n) => n,
             Err(_) => break,
         };
-        if stream.write_all(&chunk[..n]).await.is_err() { break; }
+        if stream.write_all(&chunk[..n]).await.is_err() {
+            break;
+        }
     }
     // Flush any data still sitting in BufStream's write buffer — on drop
     // that buffer is discarded and the tail of the file would be lost.
     let _ = stream.flush().await;
 }
 
-pub async fn handle_connection(stream: TcpStream, addr: SocketAddr, token: Arc<String>, machine_id: Arc<String>, auth_tracker: AuthTracker, resize_tracker: ResizeTracker, grace_secs: u64, team: OptTeam) {
+pub async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    token: Arc<String>,
+    machine_id: Arc<String>,
+    auth_tracker: AuthTracker,
+    resize_tracker: ResizeTracker,
+    grace_secs: u64,
+    team: OptTeam,
+) {
     // Peek at the request prelude to distinguish HTTP download from
     // WebSocket. 256 bytes covers the request line even with a reverse-proxy
     // path prefix; peek doesn't consume, so the WS handshake still sees the
@@ -1274,9 +1440,8 @@ pub async fn handle_connection(stream: TcpStream, addr: SocketAddr, token: Arc<S
     // the tracker doesn't grow unbounded under a distributed scan.
     {
         let mut tracker = auth_tracker.lock().await;
-        tracker.retain(|_ip, (_fails, since)| {
-            since.elapsed().as_secs() < AUTH_TRACKER_GC_AFTER_SECS
-        });
+        tracker
+            .retain(|_ip, (_fails, since)| since.elapsed().as_secs() < AUTH_TRACKER_GC_AFTER_SECS);
         if let Some((fails, since)) = tracker.get(&addr.ip()) {
             if *fails >= MAX_AUTH_FAILURES && since.elapsed().as_secs() < AUTH_LOCKOUT_SECS {
                 eprintln!("🚫 Rejected {} (locked out, {} failures)", addr, fails);
@@ -1293,11 +1458,33 @@ pub async fn handle_connection(stream: TcpStream, addr: SocketAddr, token: Arc<S
         }
     };
 
-    handle_connection_ws(ws_stream, addr, token, machine_id, auth_tracker, resize_tracker, conn_id, conn_started_at, grace_secs, team).await;
+    handle_connection_ws(
+        ws_stream,
+        addr,
+        token,
+        machine_id,
+        auth_tracker,
+        resize_tracker,
+        conn_id,
+        conn_started_at,
+        grace_secs,
+        team,
+    )
+    .await;
 }
 
-async fn handle_connection_ws<S>(ws_stream: tokio_tungstenite::WebSocketStream<S>, addr: SocketAddr, token: Arc<String>, machine_id: Arc<String>, auth_tracker: AuthTracker, resize_tracker: ResizeTracker, conn_id: u64, conn_started_at: std::time::Instant, grace_secs: u64, team: OptTeam)
-where
+async fn handle_connection_ws<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    addr: SocketAddr,
+    token: Arc<String>,
+    machine_id: Arc<String>,
+    auth_tracker: AuthTracker,
+    resize_tracker: ResizeTracker,
+    conn_id: u64,
+    conn_started_at: std::time::Instant,
+    grace_secs: u64,
+    team: OptTeam,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Check if IP is locked out
@@ -1350,7 +1537,10 @@ where
             let is_snapshot = matches!(msg, Outbound::Snapshot(_));
             let frame = match msg {
                 Outbound::Plain(s) => Message::Text(s.into()),
-                Outbound::InitCipher(c) => { cipher = Some(c); continue; }
+                Outbound::InitCipher(c) => {
+                    cipher = Some(c);
+                    continue;
+                }
                 Outbound::Ping(data) => Message::Ping(data.into()),
                 Outbound::Encrypted(s) | Outbound::Snapshot(s) => {
                     if let Some(ref mut c) = cipher {
@@ -1398,13 +1588,20 @@ where
     rand::thread_rng().fill_bytes(&mut server_nonce);
     {
         let msg = serde_json::json!({ "server_nonce": bytes_to_hex(&server_nonce) });
-        if out_tx.send(Outbound::Plain(serde_json::to_string(&msg).unwrap())).is_err() {
+        if out_tx
+            .send(Outbound::Plain(serde_json::to_string(&msg).unwrap()))
+            .is_err()
+        {
             return;
         }
     }
 
     // Start subscription polling task (enqueues to out_tx like any task)
-    let sub_handle = tokio::spawn(subscription_loop(out_tx.clone(), subs.clone(), snapshots_inflight.clone()));
+    let sub_handle = tokio::spawn(subscription_loop(
+        out_tx.clone(),
+        subs.clone(),
+        snapshots_inflight.clone(),
+    ));
 
     // Start keepalive: server sends WS PING every 15s; browsers auto-reply
     // with PONG in the WS layer without running app code, so this probes
@@ -1419,13 +1616,17 @@ where
         let last_pong_at = last_pong_at.clone();
         let shutdown_for_ping = shutdown.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
             tick.tick().await; // discard immediate first tick
             loop {
                 tick.tick().await;
                 let elapsed = last_pong_at.lock().unwrap().elapsed().as_secs();
                 if elapsed > PING_DEADLINE_SECS {
-                    eprintln!("💀 ping deadline exceeded ({}s > {}s) conn_id={}; tearing down", elapsed, PING_DEADLINE_SECS, conn_id);
+                    eprintln!(
+                        "💀 ping deadline exceeded ({}s > {}s) conn_id={}; tearing down",
+                        elapsed, PING_DEADLINE_SECS, conn_id
+                    );
                     shutdown_for_ping.notify_waiters();
                     return;
                 }
@@ -1466,10 +1667,18 @@ where
                     // plaintext. Kept for any old clients still using it;
                     // the new wire path goes through Message::Binary.
                     use base64::Engine;
-                    let ct = base64::engine::general_purpose::STANDARD.decode(text.as_bytes()).unwrap_or_default();
+                    let ct = base64::engine::general_purpose::STANDARD
+                        .decode(text.as_bytes())
+                        .unwrap_or_default();
                     match rc.decrypt(&ct) {
                         Ok(pt) => Some(String::from_utf8_lossy(&pt).to_string()),
-                        Err(_) => { eprintln!("❌ Decrypt failed (text path) from {} conn_id={}", addr, conn_id); break; }
+                        Err(_) => {
+                            eprintln!(
+                                "❌ Decrypt failed (text path) from {} conn_id={}",
+                                addr, conn_id
+                            );
+                            break;
+                        }
                     }
                 } else {
                     Some(text.to_string())
@@ -1479,180 +1688,232 @@ where
                 // New wire: binary ciphertext, plaintext = framing byte +
                 // (optionally deflated) JSON. Auth must already be set up.
                 let Some(rc) = recv_cipher.as_mut() else {
-                    eprintln!("❌ Binary frame before auth from {} conn_id={}", addr, conn_id);
+                    eprintln!(
+                        "❌ Binary frame before auth from {} conn_id={}",
+                        addr, conn_id
+                    );
                     break;
                 };
                 match rc.decrypt(bytes) {
                     Ok(pt) => match decode_wire_payload(&pt) {
                         Ok(s) => Some(s),
-                        Err(e) => { eprintln!("❌ Wire decode failed from {} conn_id={}: {}", addr, conn_id, e); break; }
+                        Err(e) => {
+                            eprintln!(
+                                "❌ Wire decode failed from {} conn_id={}: {}",
+                                addr, conn_id, e
+                            );
+                            break;
+                        }
                     },
-                    Err(_) => { eprintln!("❌ Decrypt failed (binary path) from {} conn_id={} bytes_len={}", addr, conn_id, bytes.len()); break; }
+                    Err(_) => {
+                        eprintln!(
+                            "❌ Decrypt failed (binary path) from {} conn_id={} bytes_len={}",
+                            addr,
+                            conn_id,
+                            bytes.len()
+                        );
+                        break;
+                    }
                 }
             }
             _ => None,
         };
 
         if let Some(plaintext) = plaintext {
-                let req = match serde_json::from_str::<Request>(&plaintext) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let r = Response::err(None, ERR_PARSE, format!("invalid JSON: {}", e));
-                        let _ = out_tx.send(if recv_cipher.is_some() {
-                            Outbound::Encrypted(serde_json::to_string(&r).unwrap())
-                        } else {
-                            Outbound::Plain(serde_json::to_string(&r).unwrap())
-                        });
-                        continue;
-                    }
-                };
+            let req = match serde_json::from_str::<Request>(&plaintext) {
+                Ok(r) => r,
+                Err(e) => {
+                    let r = Response::err(None, ERR_PARSE, format!("invalid JSON: {}", e));
+                    let _ = out_tx.send(if recv_cipher.is_some() {
+                        Outbound::Encrypted(serde_json::to_string(&r).unwrap())
+                    } else {
+                        Outbound::Plain(serde_json::to_string(&r).unwrap())
+                    });
+                    continue;
+                }
+            };
 
-                if !authenticated {
-                    // Auth must stay strictly serial (it sets up the ciphers).
-                    if req.method != "auth" {
-                        let r = Response::err(req.id, ERR_AUTH, "auth required — send {\"method\":\"auth\",\"params\":{\"token\":\"...\"}} first".into());
+            if !authenticated {
+                // Auth must stay strictly serial (it sets up the ciphers).
+                if req.method != "auth" {
+                    let r = Response::err(req.id, ERR_AUTH, "auth required — send {\"method\":\"auth\",\"params\":{\"token\":\"...\"}} first".into());
+                    let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
+                    break;
+                }
+                let client_nonce_hex = req
+                    .params
+                    .get("client_nonce")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let proof_hex = req
+                    .params
+                    .get("proof")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let plain_token = req
+                    .params
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if !client_nonce_hex.is_empty() && !proof_hex.is_empty() {
+                    // Encrypted auth
+                    let client_nonce_bytes = hex_to_bytes(client_nonce_hex).unwrap_or_default();
+                    let proof_bytes = hex_to_bytes(proof_hex).unwrap_or_default();
+                    if client_nonce_bytes.len() != 16 {
+                        let r = Response::err(req.id, ERR_AUTH, "invalid client_nonce".into());
                         let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
                         break;
                     }
-                    let client_nonce_hex = req.params.get("client_nonce").and_then(|v| v.as_str()).unwrap_or("");
-                    let proof_hex = req.params.get("proof").and_then(|v| v.as_str()).unwrap_or("");
-                    let plain_token = req.params.get("token").and_then(|v| v.as_str()).unwrap_or("");
-
-                    if !client_nonce_hex.is_empty() && !proof_hex.is_empty() {
-                        // Encrypted auth
-                        let client_nonce_bytes = hex_to_bytes(client_nonce_hex).unwrap_or_default();
-                        let proof_bytes = hex_to_bytes(proof_hex).unwrap_or_default();
-                        if client_nonce_bytes.len() != 16 {
-                            let r = Response::err(req.id, ERR_AUTH, "invalid client_nonce".into());
-                            let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
-                            break;
-                        }
-                        let mut cn = [0u8; 16];
-                        cn.copy_from_slice(&client_nonce_bytes);
-                        let key = derive_key(&token, &server_nonce, &cn);
-                        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
-                        // Bind proof to BOTH nonces so a captured proof from
-                        // a previous handshake can't be replayed: each
-                        // session has a fresh (server_nonce, client_nonce)
-                        // pair, and the MAC commits to both.
-                        mac.update(&server_nonce);
-                        mac.update(&cn);
-                        if mac.verify_slice(&proof_bytes).is_ok() {
-                            authenticated = true;
-                            auth_tracker.lock().await.remove(&addr.ip());
-                            // Split into two independent cipher halves — one
-                            // for the receive path (this task), one for the
-                            // send path (send task).
-                            recv_cipher = Some(HalfCipher::new(&key));
-                            // The InitCipher message must be queued before
-                            // any Encrypted message so the send task has its
-                            // cipher ready. We enqueue it first, then the
-                            // auth response.
-                            let _ = out_tx.send(Outbound::InitCipher(HalfCipher::new(&key)));
-                            let resp = serde_json::to_string(&serde_json::json!({"result":{"authenticated":true,"machine_id":*machine_id,"hostname":&hostname}})).unwrap();
-                            let _ = out_tx.send(Outbound::Encrypted(resp));
-                            if let Some(ref a) = team {
-                                team_push_handle = Some(tokio::spawn(team_push_loop(out_tx.clone(), a.clone())));
-                            }
-                            continue;
-                        } else {
-                            let mut tracker = auth_tracker.lock().await;
-                            let entry = tracker.entry(addr.ip()).or_insert((0, tokio::time::Instant::now()));
-                            if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS { *entry = (0, tokio::time::Instant::now()); }
-                            entry.0 += 1;
-                            eprintln!("🚫 Auth failed from {} (attempt {})", addr, entry.0);
-                            drop(tracker);
-                            let r = Response::err(req.id, ERR_AUTH, "invalid proof".into());
-                            let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
-                            break;
-                        }
-                    } else if provided_token_matches(plain_token, &token) {
-                        // Legacy plain token auth (http:// fallback)
+                    let mut cn = [0u8; 16];
+                    cn.copy_from_slice(&client_nonce_bytes);
+                    let key = derive_key(&token, &server_nonce, &cn);
+                    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+                    // Bind proof to BOTH nonces so a captured proof from
+                    // a previous handshake can't be replayed: each
+                    // session has a fresh (server_nonce, client_nonce)
+                    // pair, and the MAC commits to both.
+                    mac.update(&server_nonce);
+                    mac.update(&cn);
+                    if mac.verify_slice(&proof_bytes).is_ok() {
                         authenticated = true;
                         auth_tracker.lock().await.remove(&addr.ip());
-                        let r = Response::ok(req.id, serde_json::json!({ "authenticated": true, "machine_id": *machine_id, "hostname": &hostname }));
-                        let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
+                        // Split into two independent cipher halves — one
+                        // for the receive path (this task), one for the
+                        // send path (send task).
+                        recv_cipher = Some(HalfCipher::new(&key));
+                        // The InitCipher message must be queued before
+                        // any Encrypted message so the send task has its
+                        // cipher ready. We enqueue it first, then the
+                        // auth response.
+                        let _ = out_tx.send(Outbound::InitCipher(HalfCipher::new(&key)));
+                        let resp = serde_json::to_string(&serde_json::json!({"result":{"authenticated":true,"machine_id":*machine_id,"hostname":&hostname}})).unwrap();
+                        let _ = out_tx.send(Outbound::Encrypted(resp));
                         if let Some(ref a) = team {
-                            team_push_handle = Some(tokio::spawn(team_push_loop(out_tx.clone(), a.clone())));
+                            team_push_handle =
+                                Some(tokio::spawn(team_push_loop(out_tx.clone(), a.clone())));
                         }
                         continue;
                     } else {
                         let mut tracker = auth_tracker.lock().await;
-                        let entry = tracker.entry(addr.ip()).or_insert((0, tokio::time::Instant::now()));
-                        if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS { *entry = (0, tokio::time::Instant::now()); }
+                        let entry = tracker
+                            .entry(addr.ip())
+                            .or_insert((0, tokio::time::Instant::now()));
+                        if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
+                            *entry = (0, tokio::time::Instant::now());
+                        }
                         entry.0 += 1;
-                        let fails = entry.0;
+                        eprintln!("🚫 Auth failed from {} (attempt {})", addr, entry.0);
                         drop(tracker);
-                        eprintln!("🚫 Auth failed from {} (attempt {})", addr, fails);
-                        let r = Response::err(req.id, ERR_AUTH, "invalid token".into());
+                        let r = Response::err(req.id, ERR_AUTH, "invalid proof".into());
                         let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
                         break;
                     }
+                } else if provided_token_matches(plain_token, &token) {
+                    // Legacy plain token auth (http:// fallback)
+                    authenticated = true;
+                    auth_tracker.lock().await.remove(&addr.ip());
+                    let r = Response::ok(
+                        req.id,
+                        serde_json::json!({ "authenticated": true, "machine_id": *machine_id, "hostname": &hostname }),
+                    );
+                    let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
+                    if let Some(ref a) = team {
+                        team_push_handle =
+                            Some(tokio::spawn(team_push_loop(out_tx.clone(), a.clone())));
+                    }
+                    continue;
+                } else {
+                    let mut tracker = auth_tracker.lock().await;
+                    let entry = tracker
+                        .entry(addr.ip())
+                        .or_insert((0, tokio::time::Instant::now()));
+                    if entry.1.elapsed().as_secs() >= AUTH_LOCKOUT_SECS {
+                        *entry = (0, tokio::time::Instant::now());
+                    }
+                    entry.0 += 1;
+                    let fails = entry.0;
+                    drop(tracker);
+                    eprintln!("🚫 Auth failed from {} (attempt {})", addr, fails);
+                    let r = Response::err(req.id, ERR_AUTH, "invalid token".into());
+                    let _ = out_tx.send(Outbound::Plain(serde_json::to_string(&r).unwrap()));
+                    break;
                 }
+            }
 
-                // Post-auth dispatch. Each request is processed in its own
-                // task so a slow one (fs_download, fs_upload) doesn't block
-                // the receive loop from reading / dispatching the next one.
-                // Responses are funneled through out_tx and the send task
-                // keeps their encrypt + ws.send in FIFO order.
-                let subs_c = subs.clone();
-                let tracker_c = resize_tracker.clone();
-                let out_tx_c = out_tx.clone();
-                let token_c = token.clone();
-                let team_c = team.clone();
-                tokio::spawn(async move {
-                    let response = match req.method.as_str() {
-                        "subscribe" => {
-                            let mut map = subs_c.lock().await;
-                            handle_subscribe(&req.params, &mut map)
-                        }
-                        "unsubscribe" => {
-                            let mut map = subs_c.lock().await;
-                            handle_unsubscribe(&req.params, &mut map)
-                        }
-                        m if m.starts_with("team_") => handle_team_request(&req, team_c.as_deref()),
-                        "resize_pane" => {
-                            let id = req.id;
-                            let p = &req.params;
-                            let target = p.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let cols = p.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
-                            let rows = p.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as usize;
-                            let tracker = tracker_c.clone();
-                            tokio::task::spawn_blocking(move || {
-                                match tmux::resize_pane(&target, cols, rows) {
-                                    Ok(()) => {
-                                        let win = target.split('.').next().unwrap_or(&target).to_string();
-                                        let session = target.split(':').next().unwrap_or(&target);
-                                        let _ = tmux::set_resize_hook(session);
-                                        // Register this conn as an active holder
-                                        // of `win`, and cancel any in-flight
-                                        // restore task — the window is actively
-                                        // being used at a known size again.
-                                        let mut t = tracker.lock().unwrap();
-                                        let first_time_for_conn = t
-                                            .per_conn
-                                            .entry(conn_id)
-                                            .or_default()
-                                            .insert(win.clone());
-                                        let state = t.per_window.entry(win).or_default();
-                                        if let Some(h) = state.pending_restore.take() {
-                                            h.abort();
-                                        }
-                                        if first_time_for_conn {
-                                            state.active_conns = state.active_conns.saturating_add(1);
-                                        }
-                                        Response::ok(id, serde_json::json!({ "ok": true }))
+            // Post-auth dispatch. Each request is processed in its own
+            // task so a slow one (fs_download, fs_upload) doesn't block
+            // the receive loop from reading / dispatching the next one.
+            // Responses are funneled through out_tx and the send task
+            // keeps their encrypt + ws.send in FIFO order.
+            let subs_c = subs.clone();
+            let tracker_c = resize_tracker.clone();
+            let out_tx_c = out_tx.clone();
+            let token_c = token.clone();
+            let team_c = team.clone();
+            tokio::spawn(async move {
+                let response = match req.method.as_str() {
+                    "subscribe" => {
+                        let mut map = subs_c.lock().await;
+                        handle_subscribe(&req.params, &mut map)
+                    }
+                    "unsubscribe" => {
+                        let mut map = subs_c.lock().await;
+                        handle_unsubscribe(&req.params, &mut map)
+                    }
+                    m if m.starts_with("team_") => handle_team_request(&req, team_c.as_deref()),
+                    "resize_pane" => {
+                        let id = req.id;
+                        let p = &req.params;
+                        let target = p
+                            .get("target")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let cols = p.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
+                        let rows = p.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as usize;
+                        let tracker = tracker_c.clone();
+                        tokio::task::spawn_blocking(move || {
+                            match tmux::resize_pane(&target, cols, rows) {
+                                Ok(()) => {
+                                    let win =
+                                        target.split('.').next().unwrap_or(&target).to_string();
+                                    let session = target.split(':').next().unwrap_or(&target);
+                                    let _ = tmux::set_resize_hook(session);
+                                    // Register this conn as an active holder
+                                    // of `win`, and cancel any in-flight
+                                    // restore task — the window is actively
+                                    // being used at a known size again.
+                                    let mut t = tracker.lock().unwrap();
+                                    let first_time_for_conn =
+                                        t.per_conn.entry(conn_id).or_default().insert(win.clone());
+                                    let state = t.per_window.entry(win).or_default();
+                                    if let Some(h) = state.pending_restore.take() {
+                                        h.abort();
                                     }
-                                    Err(e) => Response::err(id, ERR_INTERNAL, e),
+                                    if first_time_for_conn {
+                                        state.active_conns = state.active_conns.saturating_add(1);
+                                    }
+                                    Response::ok(id, serde_json::json!({ "ok": true }))
                                 }
-                            }).await.unwrap_or_else(|e| Response::err(None, ERR_INTERNAL, format!("task panic: {}", e)))
-                        }
-                        _ => tokio::task::spawn_blocking(move || handle_request(&req, &token_c))
-                            .await
-                            .unwrap_or_else(|e| Response::err(None, ERR_INTERNAL, format!("task panic: {}", e))),
-                    };
-                    let _ = out_tx_c.send(Outbound::Encrypted(serde_json::to_string(&response).unwrap()));
-                });
+                                Err(e) => Response::err(id, ERR_INTERNAL, e),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            Response::err(None, ERR_INTERNAL, format!("task panic: {}", e))
+                        })
+                    }
+                    _ => tokio::task::spawn_blocking(move || handle_request(&req, &token_c))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Response::err(None, ERR_INTERNAL, format!("task panic: {}", e))
+                        }),
+                };
+                let _ = out_tx_c.send(Outbound::Encrypted(
+                    serde_json::to_string(&response).unwrap(),
+                ));
+            });
             continue; // data frame handled
         }
         // Control frames fall through to here.
@@ -1692,11 +1953,17 @@ where
     };
     // Decision made under the lock; side-effects (tmux call / await) happen
     // after the guard is dropped so the future stays Send.
-    enum Decision { Skip, RestoreNow, Scheduled }
+    enum Decision {
+        Skip,
+        RestoreNow,
+        Scheduled,
+    }
     for win in windows {
         let decision = {
             let mut t = resize_tracker.lock().unwrap();
-            let Some(state) = t.per_window.get_mut(&win) else { continue };
+            let Some(state) = t.per_window.get_mut(&win) else {
+                continue;
+            };
             state.active_conns = state.active_conns.saturating_sub(1);
             if state.active_conns > 0 {
                 Decision::Skip
@@ -1721,12 +1988,23 @@ where
                         // touching tmux.
                         let should_restore = {
                             let t = tracker_c.lock().unwrap();
-                            t.per_window.get(&w).map(|s| s.active_conns == 0).unwrap_or(false)
+                            t.per_window
+                                .get(&w)
+                                .map(|s| s.active_conns == 0)
+                                .unwrap_or(false)
                         };
-                        if !should_restore { return; }
+                        if !should_restore {
+                            return;
+                        }
                         let w2 = w.clone();
-                        let _ = tokio::task::spawn_blocking(move || tmux::run_resize_window_auto(&w2)).await;
-                        eprintln!("📐 Restored window '{}' to auto-size (after {}s grace)", w, grace.as_secs());
+                        let _ =
+                            tokio::task::spawn_blocking(move || tmux::run_resize_window_auto(&w2))
+                                .await;
+                        eprintln!(
+                            "📐 Restored window '{}' to auto-size (after {}s grace)",
+                            w,
+                            grace.as_secs()
+                        );
                         let mut t = tracker_c.lock().unwrap();
                         if let Some(s) = t.per_window.get(&w) {
                             if s.active_conns == 0 {
@@ -1753,7 +2031,10 @@ where
                 }
             }
             Decision::Scheduled => {
-                eprintln!("⏳ Window '{}' scheduled for restore in {}s", win, grace_secs);
+                eprintln!(
+                    "⏳ Window '{}' scheduled for restore in {}s",
+                    win, grace_secs
+                );
             }
         }
     }
@@ -1789,7 +2070,8 @@ pub async fn start_with_socket(
     let token = Arc::new(token.to_string());
     let machine_id = Arc::new(machine_id.to_string());
     let auth_tracker: AuthTracker = Arc::new(Mutex::new(HashMap::new()));
-    let resize_tracker: ResizeTracker = Arc::new(std::sync::Mutex::new(ResizeTrackerInner::default()));
+    let resize_tracker: ResizeTracker =
+        Arc::new(std::sync::Mutex::new(ResizeTrackerInner::default()));
 
     // Load TLS config if cert+key provided
     let tls_acceptor = match (&tls_cert, &tls_key) {
@@ -1861,20 +2143,50 @@ pub async fn start_with_socket(
                             handle_http_download(buf_stream, addr, token).await;
                             return;
                         }
-                        let ws_stream = match tokio_tungstenite::accept_async_with_config(buf_stream, Some(ws_config())).await {
+                        let ws_stream = match tokio_tungstenite::accept_async_with_config(
+                            buf_stream,
+                            Some(ws_config()),
+                        )
+                        .await
+                        {
                             Ok(ws) => ws,
-                            Err(e) => { eprintln!("❌ WSS handshake failed for {}: {}", addr, e); return; }
+                            Err(e) => {
+                                eprintln!("❌ WSS handshake failed for {}: {}", addr, e);
+                                return;
+                            }
                         };
-                        let conn_id = CONN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let conn_id =
+                            CONN_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let conn_started_at = std::time::Instant::now();
                         println!("📱 Client connected (TLS): {} (conn_id={})", addr, conn_id);
-                        handle_connection_ws(ws_stream, addr, token, machine_id, auth_tracker, control_mgr, conn_id, conn_started_at, grace, team_c).await;
+                        handle_connection_ws(
+                            ws_stream,
+                            addr,
+                            token,
+                            machine_id,
+                            auth_tracker,
+                            control_mgr,
+                            conn_id,
+                            conn_started_at,
+                            grace,
+                            team_c,
+                        )
+                        .await;
                     }
                     Err(e) => eprintln!("❌ TLS handshake failed for {}: {}", addr, e),
                 }
             });
         } else {
-            tokio::spawn(handle_connection(stream, addr, token, machine_id, auth_tracker, control_mgr, grace, team_c));
+            tokio::spawn(handle_connection(
+                stream,
+                addr,
+                token,
+                machine_id,
+                auth_tracker,
+                control_mgr,
+                grace,
+                team_c,
+            ));
         }
     }
 }
@@ -1894,8 +2206,16 @@ mod tests {
         fn roster(&self, _room: &str) -> serde_json::Value {
             serde_json::json!({ "roster": [{ "name": "worker", "status": "idle" }] })
         }
-        fn post(&self, room: &str, from: &str, body: &str, requires_reply: bool) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({ "room": room, "from": from, "body": body, "requires_reply": requires_reply }))
+        fn post(
+            &self,
+            room: &str,
+            from: &str,
+            body: &str,
+            requires_reply: bool,
+        ) -> Result<serde_json::Value, String> {
+            Ok(
+                serde_json::json!({ "room": room, "from": from, "body": body, "requires_reply": requires_reply }),
+            )
         }
         fn set_agent_status(&self, _room: &str, _agent: &str, _status: &str) -> Result<(), String> {
             Ok(())
@@ -1903,15 +2223,28 @@ mod tests {
         fn employees(&self, _room: &str) -> serde_json::Value {
             serde_json::json!({ "employees": [] })
         }
-        fn seed_employee(&self, _room: &str, _name: &str, _spec: &serde_json::Value) -> Result<(), String> {
+        fn usage(&self, _room: &str) -> serde_json::Value {
+            serde_json::json!({ "usage": [] })
+        }
+        fn seed_employee(
+            &self,
+            _room: &str,
+            _name: &str,
+            _spec: &serde_json::Value,
+        ) -> Result<(), String> {
             Ok(())
         }
         fn employee_specs(&self, _room: &str) -> Vec<(String, serde_json::Value, String)> {
             Vec::new()
         }
-        fn room_exists(&self, _room: &str) -> bool { true }
+        fn room_exists(&self, _room: &str) -> bool {
+            true
+        }
         fn start_team(&self, workspace: &str, template: &str) -> serde_json::Value {
             serde_json::json!({ "started": true, "room": "ws", "workspace": workspace, "template": template })
+        }
+        fn clone_team(&self, room: &str) -> serde_json::Value {
+            serde_json::json!({ "started": true, "room": format!("{}-clone", room), "cloned_from": room })
         }
         fn close_team(&self, _room: &str) -> bool {
             true
@@ -1937,6 +2270,16 @@ mod tests {
         fn default_workspace(&self) -> String {
             "/tmp/ws".to_string()
         }
+        fn recent_workspaces(&self) -> serde_json::Value {
+            serde_json::json!({
+                "recent_workspaces": [{
+                    "workspace": "/tmp/ws",
+                    "template": "default",
+                    "room": "ws",
+                    "last_started": 1
+                }]
+            })
+        }
         fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
             let (tx, rx) = tokio::sync::broadcast::channel(4);
             let _ = tx; // keep the sender alive only as long as needed for the type
@@ -1945,7 +2288,11 @@ mod tests {
     }
 
     fn req(method: &str, params: serde_json::Value) -> Request {
-        Request { id: Some(1), method: method.to_string(), params }
+        Request {
+            id: Some(1),
+            method: method.to_string(),
+            params,
+        }
     }
 
     #[test]
@@ -1957,7 +2304,10 @@ mod tests {
     #[test]
     fn team_roster_returns_roster() {
         let bus = MockAgora;
-        let r = handle_team_request(&req("team_roster", serde_json::json!({ "room": "ws" })), Some(&bus));
+        let r = handle_team_request(
+            &req("team_roster", serde_json::json!({ "room": "ws" })),
+            Some(&bus),
+        );
         let roster = r.result.unwrap();
         assert_eq!(roster["roster"][0]["name"], "worker");
     }
@@ -1966,23 +2316,38 @@ mod tests {
     fn team_post_requires_room_and_body_and_infers_reply_from_mention() {
         let bus = MockAgora;
         // Missing room → invalid params.
-        let no_room = handle_team_request(&req("team_post", serde_json::json!({ "body": "hi" })), Some(&bus));
-        assert_eq!(no_room.error.as_ref().map(|e| e.code), Some(ERR_INVALID_PARAMS));
+        let no_room = handle_team_request(
+            &req("team_post", serde_json::json!({ "body": "hi" })),
+            Some(&bus),
+        );
+        assert_eq!(
+            no_room.error.as_ref().map(|e| e.code),
+            Some(ERR_INVALID_PARAMS)
+        );
 
         // Missing body → invalid params.
-        let bad = handle_team_request(&req("team_post", serde_json::json!({ "room": "ws" })), Some(&bus));
+        let bad = handle_team_request(
+            &req("team_post", serde_json::json!({ "room": "ws" })),
+            Some(&bus),
+        );
         assert_eq!(bad.error.as_ref().map(|e| e.code), Some(ERR_INVALID_PARAMS));
 
         // @mention with no explicit flag → requires_reply inferred true.
         let mentioned = handle_team_request(
-            &req("team_post", serde_json::json!({ "room": "ws", "body": "@worker do X" })),
+            &req(
+                "team_post",
+                serde_json::json!({ "room": "ws", "body": "@worker do X" }),
+            ),
             Some(&bus),
         );
         assert_eq!(mentioned.result.unwrap()["message"]["requires_reply"], true);
 
         // Plain broadcast → requires_reply inferred false; default sender "human".
         let plain = handle_team_request(
-            &req("team_post", serde_json::json!({ "room": "ws", "body": "hello team" })),
+            &req(
+                "team_post",
+                serde_json::json!({ "room": "ws", "body": "hello team" }),
+            ),
             Some(&bus),
         );
         let msg = plain.result.unwrap();
@@ -1991,7 +2356,10 @@ mod tests {
 
         // Explicit requires_reply=false overrides the @mention inference.
         let forced = handle_team_request(
-            &req("team_post", serde_json::json!({ "room": "ws", "body": "@worker fyi", "requires_reply": false })),
+            &req(
+                "team_post",
+                serde_json::json!({ "room": "ws", "body": "@worker fyi", "requires_reply": false }),
+            ),
             Some(&bus),
         );
         assert_eq!(forced.result.unwrap()["message"]["requires_reply"], false);
@@ -2007,6 +2375,25 @@ mod tests {
     }
 
     #[test]
+    fn team_clone_requires_room_and_returns_new_room() {
+        let bus = MockAgora;
+        let no_room =
+            handle_team_request(&req("team_clone_team", serde_json::json!({})), Some(&bus));
+        assert_eq!(
+            no_room.error.as_ref().map(|e| e.code),
+            Some(ERR_INVALID_PARAMS)
+        );
+
+        let ok = handle_team_request(
+            &req("team_clone_team", serde_json::json!({ "room": "alpha" })),
+            Some(&bus),
+        );
+        let body = ok.result.unwrap();
+        assert_eq!(body["cloned_from"], "alpha");
+        assert_eq!(body["room"], "alpha-clone");
+    }
+
+    #[test]
     fn team_unknown_method_is_method_not_found() {
         let bus = MockAgora;
         let r = handle_team_request(&req("team_bogus", serde_json::json!({})), Some(&bus));
@@ -2019,7 +2406,10 @@ mod tests {
     fn wire_small_payload_skips_compression() {
         let json = r#"{"id":1,"result":"pong"}"#;
         let encoded = encode_wire_payload(json);
-        assert_eq!(encoded[0], WIRE_PLAIN_JSON, "small payload must stay uncompressed");
+        assert_eq!(
+            encoded[0], WIRE_PLAIN_JSON,
+            "small payload must stay uncompressed"
+        );
         assert_eq!(&encoded[1..], json.as_bytes());
         assert_eq!(decode_wire_payload(&encoded).unwrap(), json);
     }
@@ -2030,7 +2420,10 @@ mod tests {
         let json = format!(r#"{{"content":"{}"}}"#, "ABCDEFGH".repeat(500));
         assert!(json.len() > COMPRESS_MIN_BYTES);
         let encoded = encode_wire_payload(&json);
-        assert_eq!(encoded[0], WIRE_DEFLATE_JSON, "large payload must be compressed");
+        assert_eq!(
+            encoded[0], WIRE_DEFLATE_JSON,
+            "large payload must be compressed"
+        );
         assert!(
             encoded.len() < json.len() / 5,
             "compression ratio too weak: {} → {}",
@@ -2108,7 +2501,13 @@ mod tests {
     fn encrypted_compressed_roundtrip_typical_pane_snapshot() {
         // Mimic a `pane_output` notification with a 50-line pane payload.
         let pane = (0..50)
-            .map(|i| format!("\u{001b}[38;5;{}m line {} content content content\u{001b}[0m", (i % 200) + 16, i))
+            .map(|i| {
+                format!(
+                    "\u{001b}[38;5;{}m line {} content content content\u{001b}[0m",
+                    (i % 200) + 16,
+                    i
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let msg = serde_json::json!({
@@ -2178,7 +2577,10 @@ mod tests {
         let _ct2 = send_c.encrypt(pt);
         // Skip ahead on the receive side, then try to decrypt ct1.
         let _ = recv_c.decrypt(&_ct2); // advances counter past ct1
-        assert!(recv_c.decrypt(&ct1).is_err(), "ct1 must fail under wrong nonce");
+        assert!(
+            recv_c.decrypt(&ct1).is_err(),
+            "ct1 must fail under wrong nonce"
+        );
     }
 
     // ─── HTTP /dl request parsing ────────────────────────────────────────
@@ -2206,18 +2608,27 @@ mod tests {
 
     #[test]
     fn dl_detection_with_and_without_proxy_prefix() {
-        assert!(looks_like_dl_request(b"GET /dl?path=a&ts=1&sig=b HTTP/1.1\r\n"));
+        assert!(looks_like_dl_request(
+            b"GET /dl?path=a&ts=1&sig=b HTTP/1.1\r\n"
+        ));
         // Reverse proxy that forwards its location prefix unstripped.
         assert!(looks_like_dl_request(b"GET /tmux/dl?path=a HTTP/1.1\r\n"));
-        assert!(!looks_like_dl_request(b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n"));
+        assert!(!looks_like_dl_request(
+            b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n"
+        ));
         // "/dl?" appearing only in a header (not the request line) must not match.
-        assert!(!looks_like_dl_request(b"GET /ws HTTP/1.1\r\nReferer: /dl?x\r\n"));
+        assert!(!looks_like_dl_request(
+            b"GET /ws HTTP/1.1\r\nReferer: /dl?x\r\n"
+        ));
         assert!(!looks_like_dl_request(b"POST /dl?path=a HTTP/1.1\r\n"));
     }
 
     #[test]
     fn header_end_detection() {
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\nHost: h\r\n\r\nbody"), Some(23));
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\nHost: h\r\n\r\nbody"),
+            Some(23)
+        );
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\nHost: h\r\n"), None);
     }
 
@@ -2227,7 +2638,14 @@ mod tests {
         // strict assertion (avoid making future deflate library updates
         // flap the test), just bounds.
         let lines: Vec<String> = (0..24)
-            .map(|i| format!("$ command --flag-{}={}\u{001b}[0m output for row {}", i, i * 7, i))
+            .map(|i| {
+                format!(
+                    "$ command --flag-{}={}\u{001b}[0m output for row {}",
+                    i,
+                    i * 7,
+                    i
+                )
+            })
             .collect();
         let snapshot = lines.join("\n");
         let json = serde_json::json!({"content": snapshot}).to_string();
@@ -2241,4 +2659,3 @@ mod tests {
         assert!(plaintext.len() < json.len(), "wire payload should shrink");
     }
 }
-

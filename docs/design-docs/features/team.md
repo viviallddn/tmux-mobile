@@ -100,9 +100,9 @@ Why this shape, and what was rejected:
 
 ## 2b. Multiple teams = isolated rooms
 
-The bus is **room-aware**: each team is its own chat **room** (id = the
-workspace slug), fully isolated — separate message log, roster, and obligation
-graph. One daemon serves all rooms.
+The bus is **room-aware**: each team is its own chat **room** (normally the
+workspace slug; cloned teams add a clone suffix), fully isolated — separate
+message log, roster, and obligation graph. One daemon serves all rooms.
 
 - **agora crate**: a `BusProvider` trait (`room → Bus`) that `mcp.rs`/`web.rs`
   resolve per request — agents via an **`x-room` header**, the human API via a
@@ -118,9 +118,10 @@ graph. One daemon serves all rooms.
 - **Agents** are launched with an `x-room` header for their team's room, so
   kiro/claude/codex each join the right chat.
 - **Team tab UI**: a header dropdown lists active teams (room · agent count),
-  "+ New team" opens the workspace picker, and "×" closes the active team
-  (`team_close_team` kills its tmux session; the chat log persists in the db, so
-  re-starting the same workspace resumes its history).
+  "+ New team" opens the workspace picker, "Clone" copies the active team's
+  desired roster into a fresh room/session (`team_clone_team`), and "×" closes
+  the active team (`team_close_team` kills its tmux session; the chat log
+  persists in the db, so re-starting the same workspace resumes its history).
 
 ## 3. Per-workspace teams (the "limited to a directory" requirement)
 
@@ -409,7 +410,9 @@ Regression test: `can_discharge_debt_to_unregistered_human`.
 Desktop server reads (config.toml or env, `AGORA_*` accepted as legacy aliases):
 `team_bind`/`TEAM_BIND` (default `127.0.0.1:8787`), `team_db`/`TEAM_DB` (default
 `~/.config/tmux-mobile/team.db`), `team_room`/`TEAM_ROOM` (default `main`),
-`team_model`/`TEAM_MODEL` (default `claude-sonnet-4.6`). Bus startup is
+`team_model`/`TEAM_MODEL` (default `claude-sonnet-4.6`, used only by
+kiro-backed agents with no explicit model). Claude and Codex agents inherit
+their CLI defaults unless a model is set on that agent. Bus startup is
 best-effort: on failure the terminal server still runs and the Team tab stays
 hidden.
 

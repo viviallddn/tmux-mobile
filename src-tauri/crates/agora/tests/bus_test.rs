@@ -11,7 +11,11 @@ fn new_bus() -> Bus {
 
 async fn drain(bus: &Bus, agent: &str) {
     loop {
-        match bus.wait(agent, Some(Duration::from_millis(50))).await.unwrap() {
+        match bus
+            .wait(agent, Some(Duration::from_millis(50)))
+            .await
+            .unwrap()
+        {
             WaitOutcome::Idle { .. } => break,
             _ => continue,
         }
@@ -29,8 +33,14 @@ async fn wait_delivers_addressed_and_human_messages_with_roster() {
     // An agent message addressed to bob (@bob) is a trigger → delivered.
     bus.post("alice", "@bob hello room", false).unwrap();
 
-    match bus.wait("bob", Some(Duration::from_millis(500))).await.unwrap() {
-        WaitOutcome::Delivered { messages, roster, .. } => {
+    match bus
+        .wait("bob", Some(Duration::from_millis(500)))
+        .await
+        .unwrap()
+    {
+        WaitOutcome::Delivered {
+            messages, roster, ..
+        } => {
             assert!(messages.iter().any(|m| m.body.contains("hello room")));
             assert!(messages.iter().all(|m| m.from != "bob"));
             assert!(roster.iter().any(|a| a.name == "alice"));
@@ -51,18 +61,34 @@ async fn agent_chatter_is_held_then_flushed_on_trigger() {
 
     // worker thinks out loud (broadcast, not @lead) → lead must NOT be woken.
     bus.post("worker", "thinking out loud", false).unwrap();
-    let held = bus.wait("lead", Some(Duration::from_millis(200))).await.unwrap();
-    assert!(matches!(held, WaitOutcome::Idle { .. }),
-        "un-addressed agent chatter must be held, got {held:?}");
+    let held = bus
+        .wait("lead", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(held, WaitOutcome::Idle { .. }),
+        "un-addressed agent chatter must be held, got {held:?}"
+    );
 
     // A human message is always a trigger → flush EVERYTHING new in one batch.
-    bus.post("human", "@lead what's the status?", false).unwrap();
-    match bus.wait("lead", Some(Duration::from_millis(500))).await.unwrap() {
+    bus.post("human", "@lead what's the status?", false)
+        .unwrap();
+    match bus
+        .wait("lead", Some(Duration::from_millis(500)))
+        .await
+        .unwrap()
+    {
         WaitOutcome::Delivered { messages, .. } => {
-            assert!(messages.iter().any(|m| m.body.contains("thinking out loud")),
-                "the held chatter must ride along in the flushed batch");
-            assert!(messages.iter().any(|m| m.body.contains("status")),
-                "the triggering human message must be delivered");
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.body.contains("thinking out loud")),
+                "the held chatter must ride along in the flushed batch"
+            );
+            assert!(
+                messages.iter().any(|m| m.body.contains("status")),
+                "the triggering human message must be delivered"
+            );
         }
         other => panic!("expected a flushed batch, got {other:?}"),
     }
@@ -76,9 +102,18 @@ async fn broadcast_creates_no_obligation() {
     drain(&bus, "bob").await;
 
     bus.post("alice", "fyi everyone", false).unwrap();
-    let _ = bus.wait("bob", Some(Duration::from_millis(200))).await.unwrap();
-    let again = bus.wait("bob", Some(Duration::from_millis(200))).await.unwrap();
-    assert!(matches!(again, WaitOutcome::Idle { .. }), "broadcast must not block, got {again:?}");
+    let _ = bus
+        .wait("bob", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    let again = bus
+        .wait("bob", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(again, WaitOutcome::Idle { .. }),
+        "broadcast must not block, got {again:?}"
+    );
 }
 
 #[tokio::test]
@@ -89,11 +124,20 @@ async fn mention_without_requires_reply_does_not_block() {
     drain(&bus, "worker").await;
 
     // @mention but requires_reply=false -> informational; worker is NOT obligated.
-    bus.post("lead", "@worker fyi, the spec changed", false).unwrap();
-    let _ = bus.wait("worker", Some(Duration::from_millis(200))).await.unwrap();
-    let again = bus.wait("worker", Some(Duration::from_millis(200))).await.unwrap();
-    assert!(matches!(again, WaitOutcome::Idle { .. }),
-        "an @mention without requires_reply must not block, got {again:?}");
+    bus.post("lead", "@worker fyi, the spec changed", false)
+        .unwrap();
+    let _ = bus
+        .wait("worker", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    let again = bus
+        .wait("worker", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(again, WaitOutcome::Idle { .. }),
+        "an @mention without requires_reply must not block, got {again:?}"
+    );
 }
 
 #[tokio::test]
@@ -105,11 +149,19 @@ async fn requires_reply_blocks_until_replied_and_resurfaces_message() {
 
     // @worker + requires_reply -> worker owes lead.
     bus.post("lead", "@worker build the API", true).unwrap();
-    assert!(matches!(bus.wait("worker", Some(Duration::from_millis(300))).await.unwrap(),
-        WaitOutcome::Delivered { .. }));
+    assert!(matches!(
+        bus.wait("worker", Some(Duration::from_millis(300)))
+            .await
+            .unwrap(),
+        WaitOutcome::Delivered { .. }
+    ));
 
     // Re-wait without replying -> blocked, and the exact message is re-surfaced.
-    match bus.wait("worker", Some(Duration::from_millis(300))).await.unwrap() {
+    match bus
+        .wait("worker", Some(Duration::from_millis(300)))
+        .await
+        .unwrap()
+    {
         WaitOutcome::Blocked { you_owe, pending } => {
             assert_eq!(you_owe, vec!["lead".to_string()]);
             assert!(pending.iter().any(|m| m.body.contains("build the API")));
@@ -119,14 +171,29 @@ async fn requires_reply_blocks_until_replied_and_resurfaces_message() {
 
     // A plain broadcast ack does NOT discharge (no @lead).
     bus.post("worker", "收到，正在处理", false).unwrap();
-    assert!(matches!(bus.wait("worker", Some(Duration::from_millis(200))).await.unwrap(),
-        WaitOutcome::Blocked { .. }), "broadcast ack must not discharge");
+    assert!(
+        matches!(
+            bus.wait("worker", Some(Duration::from_millis(200)))
+                .await
+                .unwrap(),
+            WaitOutcome::Blocked { .. }
+        ),
+        "broadcast ack must not discharge"
+    );
 
     // Replying with @lead discharges.
     bus.post("worker", "@lead done, see out.md", false).unwrap();
-    let after = bus.wait("worker", Some(Duration::from_millis(300))).await.unwrap();
-    assert!(matches!(after, WaitOutcome::Idle { .. } | WaitOutcome::Delivered { .. }),
-        "after @lead reply, wait should be allowed, got {after:?}");
+    let after = bus
+        .wait("worker", Some(Duration::from_millis(300)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            after,
+            WaitOutcome::Idle { .. } | WaitOutcome::Delivered { .. }
+        ),
+        "after @lead reply, wait should be allowed, got {after:?}"
+    );
 }
 
 #[tokio::test]
@@ -135,11 +202,17 @@ async fn reply_does_not_ping_pong() {
     bus.join("lead", None).unwrap();
     bus.join("worker", None).unwrap();
 
-    bus.post("lead", "@worker do X", true).unwrap();   // worker owes lead
+    bus.post("lead", "@worker do X", true).unwrap(); // worker owes lead
     bus.post("worker", "@lead done X", false).unwrap(); // discharges; no new obligation
 
-    let lead = bus.wait("lead", Some(Duration::from_millis(200))).await.unwrap();
-    assert!(!matches!(lead, WaitOutcome::Blocked { .. }), "reply must not obligate lead, got {lead:?}");
+    let lead = bus
+        .wait("lead", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    assert!(
+        !matches!(lead, WaitOutcome::Blocked { .. }),
+        "reply must not obligate lead, got {lead:?}"
+    );
 }
 
 #[tokio::test]
@@ -156,21 +229,31 @@ async fn can_discharge_debt_to_unregistered_human() {
     // Human (unregistered) directs worker with a required reply.
     bus.post("human", "@worker 你在线吗", true).unwrap();
     assert!(matches!(
-        bus.wait("worker", Some(Duration::from_millis(300))).await.unwrap(),
+        bus.wait("worker", Some(Duration::from_millis(300)))
+            .await
+            .unwrap(),
         WaitOutcome::Delivered { .. }
     ));
 
     // Worker owes "human"; re-wait is blocked until it answers.
     assert!(matches!(
-        bus.wait("worker", Some(Duration::from_millis(200))).await.unwrap(),
+        bus.wait("worker", Some(Duration::from_millis(200)))
+            .await
+            .unwrap(),
         WaitOutcome::Blocked { .. }
     ));
 
     // Replying "@human …" discharges the debt even though human is unregistered.
     bus.post("worker", "@human 在线", false).unwrap();
-    let after = bus.wait("worker", Some(Duration::from_millis(300))).await.unwrap();
+    let after = bus
+        .wait("worker", Some(Duration::from_millis(300)))
+        .await
+        .unwrap();
     assert!(
-        matches!(after, WaitOutcome::Idle { .. } | WaitOutcome::Delivered { .. }),
+        matches!(
+            after,
+            WaitOutcome::Idle { .. } | WaitOutcome::Delivered { .. }
+        ),
         "debt to unregistered human must clear; got {after:?}"
     );
 }
@@ -181,7 +264,10 @@ async fn mention_of_unregistered_name_creates_no_obligation() {
     bus.join("manager", None).unwrap();
     // @ghost is not a registered agent -> no recipient, no obligation.
     bus.post("manager", "@ghost please report", true).unwrap();
-    let m = bus.wait("manager", Some(Duration::from_millis(200))).await.unwrap();
+    let m = bus
+        .wait("manager", Some(Duration::from_millis(200)))
+        .await
+        .unwrap();
     assert!(!matches!(m, WaitOutcome::Blocked { .. }));
 }
 
@@ -198,7 +284,10 @@ async fn quiescence_done_vs_deadlock() {
     // lead requires a reply from worker; worker stays idle but now owes -> deadlock.
     bus.post("lead", "@worker do Y", true).unwrap();
     drain(&bus, "lead").await;
-    assert!(matches!(bus.quiescence().unwrap(), Quiescence::Deadlock { .. }));
+    assert!(matches!(
+        bus.quiescence().unwrap(),
+        Quiescence::Deadlock { .. }
+    ));
 }
 
 #[tokio::test]
@@ -207,15 +296,27 @@ async fn hire_uniqueness_and_fire() {
     bus.join("manager", None).unwrap();
 
     bus.hire("manager", "search-worker", "web search").unwrap();
-    assert!(bus.employees().unwrap().iter().any(|e| e.name == "search-worker" && e.state == "requested"));
+    assert!(bus
+        .employees()
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "search-worker" && e.state == "requested"));
 
     assert!(bus.hire("manager", "search-worker", "x").is_err()); // duplicate employee
-    assert!(bus.hire("manager", "manager", "x").is_err());       // name of an online agent
+    assert!(bus.hire("manager", "manager", "x").is_err()); // name of an online agent
 
     bus.join("search-worker", None).unwrap();
-    assert!(bus.employees().unwrap().iter().any(|e| e.name == "search-worker" && e.state == "active"));
+    assert!(bus
+        .employees()
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "search-worker" && e.state == "active"));
 
     bus.fire("manager", "search-worker").unwrap();
-    assert!(bus.employees().unwrap().iter().any(|e| e.name == "search-worker" && e.state == "disabled"));
+    assert!(bus
+        .employees()
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "search-worker" && e.state == "disabled"));
     bus.hire("manager", "search-worker", "again").unwrap(); // re-hire after fire
 }

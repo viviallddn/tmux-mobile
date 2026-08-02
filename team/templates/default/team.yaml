@@ -33,7 +33,7 @@
 #         - https://github.com/anthropics/claude-code/tree/main/plugins/frontend-design/skills/frontend-design
 agents:
 - name: manager
-  backend: kiro
+  backend: codex
   role: manager
   goal: Coordinate the effort for the human. Clarify the objective, break it into small tasks, and @-assign
     each to a worker — you don't implement yourself. When a worker reports done, integrate the result
@@ -43,7 +43,7 @@ agents:
   model: ''
   manage: true
 - name: worker
-  backend: kiro
+  backend: claude
   role: worker
   goal: Do the tasks @-addressed to you (others are context — don't grab them). When done, write your
     output to the workspace files and @manager a one-line report of what is done and where.

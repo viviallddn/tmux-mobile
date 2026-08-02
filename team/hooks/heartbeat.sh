@@ -32,5 +32,6 @@ esac
 
 ( curl -s -m 2 -X POST "$TEAM_HB_URL" \
     -H "x-agent: ${TEAM_AGENT:-}" \
-    -H "x-room: ${TEAM_ROOM:-}" >/dev/null 2>&1 ) &
+    -H "x-room: ${TEAM_ROOM:-}" \
+    -H "x-agent-role: ${TEAM_AGENT_ROLE:-}" >/dev/null 2>&1 ) &
 exit 0

@@ -224,11 +224,7 @@ async fn concurrent_pings_decrypt_cleanly() {
         let v = client.recv_response().await;
         let id = v["id"].as_u64().expect("id in response");
         assert_eq!(v["result"].as_str(), Some("pong"));
-        assert!(
-            ids_seen.insert(id),
-            "duplicate response id {}",
-            id
-        );
+        assert!(ids_seen.insert(id), "duplicate response id {}", id);
     }
     assert_eq!(ids_seen.len() as u64, N);
 }
@@ -294,7 +290,10 @@ async fn responses_may_interleave_but_id_matches() {
     sent.sort();
     let mut seen_sorted = seen.clone();
     seen_sorted.sort();
-    assert_eq!(seen_sorted, sent, "every request id should come back exactly once");
+    assert_eq!(
+        seen_sorted, sent,
+        "every request id should come back exactly once"
+    );
 }
 
 #[tokio::test]
@@ -321,13 +320,20 @@ async fn client_counter_mismatch_fails_decrypt() {
     // counter — we don't decode the wire payload, so deflate is irrelevant.
     // Correct counter (1) would succeed; wrong counter (99) must fail.
     let wrong_nonce = make_nonce(99);
-    let result = client.recv_cipher.decrypt(Nonce::from_slice(&wrong_nonce), ct.as_ref());
+    let result = client
+        .recv_cipher
+        .decrypt(Nonce::from_slice(&wrong_nonce), ct.as_ref());
     assert!(result.is_err(), "decrypt with bad counter should fail");
 
     // And the correct counter still works — proves we didn't mangle the ciphertext.
     let right_nonce = make_nonce(client.recv_counter);
-    let result = client.recv_cipher.decrypt(Nonce::from_slice(&right_nonce), ct.as_ref());
-    assert!(result.is_ok(), "decrypt with correct counter should succeed");
+    let result = client
+        .recv_cipher
+        .decrypt(Nonce::from_slice(&right_nonce), ct.as_ref());
+    assert!(
+        result.is_ok(),
+        "decrypt with correct counter should succeed"
+    );
 }
 
 #[tokio::test]
@@ -549,15 +555,22 @@ impl PlainClient {
             other => panic!("expected text, got {:?}", other),
         };
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["result"]["authenticated"].as_bool(), Some(true), "plain auth failed: {}", text);
+        assert_eq!(
+            v["result"]["authenticated"].as_bool(),
+            Some(true),
+            "plain auth failed: {}",
+            text
+        );
 
         Self { ws }
     }
 
     async fn send_rpc(&mut self, id: u64, method: &str) {
         let req = serde_json::json!({"id": id, "method": method, "params": {}});
-        self.ws.send(Message::Text(serde_json::to_string(&req).unwrap().into()))
-            .await.unwrap();
+        self.ws
+            .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
+            .await
+            .unwrap();
     }
 
     async fn recv(&mut self) -> serde_json::Value {
@@ -584,7 +597,9 @@ async fn plain_token_auth_delivers_rpc_responses() {
     c.send_rpc(42, "ping").await;
     let resp = tokio::time::timeout(Duration::from_secs(3), c.recv())
         .await
-        .expect("timed out waiting for ping response — the response was likely dropped by send_task");
+        .expect(
+            "timed out waiting for ping response — the response was likely dropped by send_task",
+        );
     assert_eq!(resp["id"].as_u64(), Some(42));
     assert_eq!(resp["result"].as_str(), Some("pong"));
 }

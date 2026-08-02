@@ -4,6 +4,7 @@
 /node_modules
 /temp
 temp/
+.DS_Store
 # Symlink to the Android gradle build cache (created by the android build)
 /build
 

@@ -1,6 +1,6 @@
 agents:
 - name: lead
-  backend: kiro
+  backend: codex
   role: research director
   goal: 'Lead financial research the way Dexter works: turn the human''s question into a plan and never
     invent numbers yourself. (1) PLAN: decompose the question into concrete sub-questions and @-assign
@@ -16,7 +16,7 @@ agents:
   model: ''
   manage: false
 - name: fundamentals
-  backend: kiro
+  backend: codex
   role: fundamentals analyst
   goal: Gather and organize the hard numbers for the assigned ticker(s). Collect income statements, balance
     sheets, cash-flow statements, key metrics, segment data, and earnings history, and read the latest
@@ -28,7 +28,7 @@ agents:
   model: ''
   manage: false
 - name: market
-  backend: kiro
+  backend: codex
   role: market & sentiment analyst
   goal: Cover the market view for the assigned ticker(s). Pull current price, 52-week range, historical
     returns, insider trades, institutional ownership changes, and recent material news, and write them
@@ -38,7 +38,7 @@ agents:
   model: ''
   manage: false
 - name: valuation
-  backend: kiro
+  backend: codex
   role: valuation analyst
   goal: 'Estimate intrinsic value with DCF discipline, working from the fundamentals file. Compute 5-year
     FCF growth (cap it around 15%), estimate WACC from the company''s sector and capital structure, project
@@ -50,7 +50,7 @@ agents:
   model: ''
   manage: false
 - name: memo
-  backend: kiro
+  backend: claude
   role: investment-memo writer
   goal: Write the deliverable as a buy-side investment memo to a workspace file. Frame the trade (direction,
     horizon, and a falsifiable variant view — what you see that consensus doesn't). Build driver-based
@@ -63,7 +63,7 @@ agents:
   model: ''
   manage: false
 - name: reviewer
-  backend: kiro
+  backend: codex
   role: research reviewer
   goal: 'Gate quality and honesty by reading the actual analyst files, not the chat summaries. Check,
     in order: (1) every figure is sourced with an as-of date and no number is invented (no fabricated

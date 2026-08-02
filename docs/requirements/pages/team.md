@@ -14,13 +14,20 @@ server. See `docs/design-docs/features/team.md` for architecture.
 - A server with the bus present but no teams shows the "New team" panel.
 
 ## Multiple teams
-- Each team is an isolated chat **room** (id = workspace slug) — separate
-  conversation, roster, and agents. Many teams (one per project) coexist.
+- Each team is an isolated chat **room** (normally id = workspace slug; cloned
+  teams append a clone suffix) — separate conversation, roster, and agents.
+  Many teams can coexist, including clones against the same workspace.
 - **Header dropdown** lists active teams (room · live agent count); pick one to
   switch the chat + agent grid to it. Live agent status chips sit on the same
   header row (dot + name; wrap on overflow; tap → preview pane).
 - **+ New team** opens the workspace picker (folder browser) + a **roster
   template** picker → `team_start_team(workspace, template)`.
+- The new-team panel also lists recently started team directories from
+  `team_status.recent_workspaces`; tapping one starts that workspace again with
+  its remembered template.
+- **Clone team** duplicates the active team's desired roster into a fresh
+  room/session (`team_clone_team(room)`), keeps the same workspace/template, and
+  starts with a clean chat log plus independent agent processes.
 - **× Close team** stops the active team's agents (`team_close_team`, kills its
   tmux session); its chat log persists, so re-starting the same workspace
   resumes history.
@@ -65,6 +72,9 @@ server. See `docs/design-docs/features/team.md` for architecture.
 - **Workspace field** — the agents' shared working directory. Defaults to the
   current terminal session's cwd (else the server's home); tap to edit before
   starting. This is the directory the team is limited to.
+- **Recent directories** — the desktop server remembers recently started team
+  workspaces separately from active-team recovery, so closing a team does not
+  remove it from the one-click start list.
 - **Start team** button → `team_start_team(workspace)`: the desktop server seeds
   the built-in roster (manager / worker / reviewer) and launches each agent into
   its own named window of `tmm-team-<slug>`, all in-process. Shows "agents coming
@@ -81,6 +91,16 @@ server. See `docs/design-docs/features/team.md` for architecture.
 
 ### Compose (bottom)
 - A row of `@name` quick-mention chips (one per present agent) above the input.
+- Typing `@` opens an inline mention picker. It includes `@all`, which the bus
+  expands to every online agent; choosing a name inserts the mention without
+  dismissing the keyboard.
+- Typing `/` opens inline team command shortcuts: `/status`, `/plan`,
+  `/review`, `/test`, `/ship`, `/stop`, `/continue`. Sending a slash command
+  expands it into a concrete `@manager` / `@reviewer` / `@tester` / `@devops` /
+  `@all` team message, so agents receive it through the normal obligation path.
+- Pasting a screenshot into the composer saves it under the active workspace's
+  `.tmm/uploads/<room>/` folder and inserts a markdown image reference into the
+  draft, so the chat can preview it and agents can inspect the file path.
 - A growing textarea + a round send button.
 - **Enter sends** (desktop); Shift+Enter inserts a newline. The send button is
   the primary path on a soft keyboard.

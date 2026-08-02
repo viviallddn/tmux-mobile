@@ -42,14 +42,18 @@ pub struct TmuxPane {
     pub child_cmd: String,
 }
 
-use std::sync::{OnceLock, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 static TMUX_SOCKET: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 static SCROLLBACK: AtomicUsize = AtomicUsize::new(500);
 
-pub fn set_scrollback(n: usize) { SCROLLBACK.store(n, Ordering::Relaxed); }
-pub fn get_scrollback() -> usize { SCROLLBACK.load(Ordering::Relaxed) }
+pub fn set_scrollback(n: usize) {
+    SCROLLBACK.store(n, Ordering::Relaxed);
+}
+pub fn get_scrollback() -> usize {
+    SCROLLBACK.load(Ordering::Relaxed)
+}
 
 fn socket_lock() -> &'static RwLock<Option<String>> {
     TMUX_SOCKET.get_or_init(|| RwLock::new(None))
@@ -158,14 +162,7 @@ pub fn list_sessions() -> Result<Vec<TmuxSession>, String> {
 
 /// 列出某个 session 的所有 pane
 pub fn list_panes(session: &str) -> Result<Vec<TmuxPane>, String> {
-    let output = run_tmux(&[
-        "list-panes",
-        "-s",
-        "-t",
-        session,
-        "-F",
-        PANE_FORMAT,
-    ])?;
+    let output = run_tmux(&["list-panes", "-s", "-t", session, "-F", PANE_FORMAT])?;
     Ok(parse_pane_lines(&output))
 }
 
@@ -176,7 +173,10 @@ const PANE_FORMAT: &str = "#{session_name}<TMM_SEP>#{window_index}<TMM_SEP>#{pan
 /// per-pane lookup and portable across macOS / Linux.
 fn process_table() -> std::collections::HashMap<u32, (u32, String)> {
     let mut map = std::collections::HashMap::new();
-    let Ok(out) = Command::new("ps").args(["-axo", "pid=,ppid=,args="]).output() else {
+    let Ok(out) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,args="])
+        .output()
+    else {
         return map;
     };
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -187,8 +187,12 @@ fn process_table() -> std::collections::HashMap<u32, (u32, String)> {
         // single whitespace char would yield an empty ppid field on every
         // padded row and drop the entire process table — the bug this fixes.)
         let mut it = line.split_whitespace();
-        let (Some(pid_tok), Some(ppid_tok)) = (it.next(), it.next()) else { continue };
-        let (Ok(pid), Ok(ppid)) = (pid_tok.parse::<u32>(), ppid_tok.parse::<u32>()) else { continue };
+        let (Some(pid_tok), Some(ppid_tok)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid_tok.parse::<u32>(), ppid_tok.parse::<u32>()) else {
+            continue;
+        };
         // args = whatever the iterator has left, rejoined with single spaces.
         // (Original spacing inside argv is irrelevant — we only substring-match
         // against it.)
@@ -214,9 +218,13 @@ fn descendant_cmd(table: &std::collections::HashMap<u32, (u32, String)>, root: u
     let mut cur = root;
     let mut acc = String::new();
     for _ in 0..4 {
-        let Some(kids) = children.get(&cur) else { break };
+        let Some(kids) = children.get(&cur) else {
+            break;
+        };
         // Lowest pid = first-spawned ≈ the foreground job.
-        let Some(&next) = kids.iter().min() else { break };
+        let Some(&next) = kids.iter().min() else {
+            break;
+        };
         if let Some((_, args)) = table.get(&next) {
             if !args.is_empty() {
                 if !acc.is_empty() {
@@ -314,9 +322,7 @@ pub fn cursor_info(target: &str) -> Result<(usize, usize, usize, usize), String>
 /// from the client. Use this where the running command actually matters
 /// (currently only `subscription_loop`); other call sites stay on the
 /// shorter signature to avoid threading a String everywhere.
-pub fn cursor_info_with_cmd(
-    target: &str,
-) -> Result<(usize, usize, usize, usize, String), String> {
+pub fn cursor_info_with_cmd(target: &str) -> Result<(usize, usize, usize, usize, String), String> {
     let out = run_tmux(&[
         "display-message",
         "-t",
@@ -458,6 +464,27 @@ pub fn send_keys(target: &str, keys: &str, literal: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// Paste text into a pane via a tmux buffer.
+///
+/// This is more reliable than `send-keys -l` for long, multi-line prompts sent
+/// into agent TUIs: tmux can bracket the paste so the application receives one
+/// paste event instead of a stream of individual newline keystrokes.
+pub fn paste_text(target: &str, text: &str) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let buffer = format!("tmm-paste-{}-{}", std::process::id(), nanos);
+    run_tmux(&["set-buffer", "-b", &buffer, "--", text])?;
+    match run_tmux(&["paste-buffer", "-d", "-p", "-b", &buffer, "-t", target]) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let _ = run_tmux(&["delete-buffer", "-b", &buffer]);
+            Err(e)
+        }
+    }
+}
+
 /// 向 pane 发送文本 + Enter
 pub fn send_command(target: &str, command: &str) -> Result<(), String> {
     send_keys(target, command, true)?;
@@ -473,7 +500,13 @@ pub fn home_dir() -> String {
 
 /// Get the working directory of the active pane in a session/target.
 pub fn pane_cwd(target: &str) -> Result<String, String> {
-    let path = run_tmux(&["display-message", "-t", target, "-p", "#{pane_current_path}"])?;
+    let path = run_tmux(&[
+        "display-message",
+        "-t",
+        target,
+        "-p",
+        "#{pane_current_path}",
+    ])?;
     let path = path.trim().to_string();
     if path.is_empty() {
         Ok(home_dir())
@@ -524,9 +557,15 @@ pub fn kill_session(name: &str) -> Result<(), String> {
 /// 创建新 window（继承当前 pane 的工作目录）
 pub fn new_window(session: &str) -> Result<(), String> {
     // Get the active pane's working directory so new window starts there
-    let cwd = run_tmux(&["display-message", "-t", session, "-p", "#{pane_current_path}"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let cwd = run_tmux(&[
+        "display-message",
+        "-t",
+        session,
+        "-p",
+        "#{pane_current_path}",
+    ])
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
     let dir = if cwd.is_empty() { home_dir() } else { cwd };
     if dir.is_empty() {
         run_tmux(&["new-window", "-t", session])?;
@@ -567,7 +606,11 @@ pub fn ensure_session(session: &str, cwd: &str) -> Result<(), String> {
     if run_tmux(&["has-session", "-t", session]).is_ok() {
         return Ok(());
     }
-    let dir = if cwd.is_empty() { home_dir() } else { cwd.to_string() };
+    let dir = if cwd.is_empty() {
+        home_dir()
+    } else {
+        cwd.to_string()
+    };
     if dir.is_empty() {
         run_tmux(&["new-session", "-d", "-s", session])?;
     } else {
@@ -583,7 +626,11 @@ pub fn ensure_session(session: &str, cwd: &str) -> Result<(), String> {
 /// launching a duplicate (idempotent across server restarts).
 pub fn find_window_by_name(session: &str, name: &str) -> Option<String> {
     let out = run_tmux(&[
-        "list-windows", "-t", session, "-F", "#{window_name}<TMM_SEP>#{pane_id}",
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{window_name}<TMM_SEP>#{pane_id}",
     ])
     .ok()?;
     for line in out.lines() {
@@ -600,7 +647,13 @@ pub fn find_window_by_name(session: &str, name: &str) -> Option<String> {
 /// All `(window_name, pane_id)` pairs in `session`. Used by team recovery to
 /// nudge every agent window back online after a server restart.
 pub fn list_named_windows(session: &str) -> Vec<(String, String)> {
-    match run_tmux(&["list-windows", "-t", session, "-F", "#{window_name}<TMM_SEP>#{pane_id}"]) {
+    match run_tmux(&[
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{window_name}<TMM_SEP>#{pane_id}",
+    ]) {
         Ok(out) => out
             .lines()
             .filter_map(|line| {
@@ -621,8 +674,21 @@ pub fn list_named_windows(session: &str) -> Vec<(String, String)> {
 /// new pane id (`%NN`). The window name lets the Team tab map an agent to its
 /// pane by `window_name`.
 pub fn new_named_window(session: &str, name: &str, cwd: &str) -> Result<String, String> {
-    let dir = if cwd.is_empty() { home_dir() } else { cwd.to_string() };
-    let mut args = vec!["new-window", "-t", session, "-n", name, "-P", "-F", "#{pane_id}"];
+    let dir = if cwd.is_empty() {
+        home_dir()
+    } else {
+        cwd.to_string()
+    };
+    let mut args = vec![
+        "new-window",
+        "-t",
+        session,
+        "-n",
+        name,
+        "-P",
+        "-F",
+        "#{pane_id}",
+    ];
     if !dir.is_empty() {
         args.push("-c");
         args.push(&dir);
@@ -660,7 +726,13 @@ pub fn set_resize_hook(session: &str) -> Result<(), String> {
         "resize-window -A ; set-hook -u -t {} client-session-changed",
         session
     );
-    run_tmux(&["set-hook", "-t", session, "client-session-changed", &hook_cmd])?;
+    run_tmux(&[
+        "set-hook",
+        "-t",
+        session,
+        "client-session-changed",
+        &hook_cmd,
+    ])?;
     Ok(())
 }
 
@@ -674,7 +746,10 @@ mod tests {
     use super::*;
 
     fn table(entries: &[(u32, u32, &str)]) -> std::collections::HashMap<u32, (u32, String)> {
-        entries.iter().map(|&(pid, ppid, args)| (pid, (ppid, args.to_string()))).collect()
+        entries
+            .iter()
+            .map(|&(pid, ppid, args)| (pid, (ppid, args.to_string())))
+            .collect()
     }
 
     #[test]
@@ -683,7 +758,11 @@ mod tests {
         // pane_current_command only says "node".
         let t = table(&[
             (100, 1, "-zsh"),
-            (200, 100, "node /Users/x/node_modules/@openai/codex/bin/codex.js"),
+            (
+                200,
+                100,
+                "node /Users/x/node_modules/@openai/codex/bin/codex.js",
+            ),
         ]);
         let cmd = descendant_cmd(&t, 100);
         assert!(cmd.contains("codex"), "got: {}", cmd);

@@ -99,6 +99,32 @@ fn migrate(conn: &Connection) -> Result<()> {
             ts     INTEGER NOT NULL,
             PRIMARY KEY (room, name)
         );
+
+        -- Latest token-usage snapshot per agent. Backends report their native
+        -- counters (Claude transcript usage, Codex token_count events); the
+        -- Team UI aggregates these rows into the usage bar.
+        CREATE TABLE IF NOT EXISTS usage_snapshots (
+            room                    TEXT NOT NULL,
+            agent                   TEXT NOT NULL,
+            backend                 TEXT NOT NULL DEFAULT '',
+            model                   TEXT,
+            source                  TEXT NOT NULL DEFAULT '',
+            session_id              TEXT,
+            input_tokens            INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens     INTEGER NOT NULL DEFAULT 0,
+            output_tokens           INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens            INTEGER NOT NULL DEFAULT 0,
+            last_input_tokens       INTEGER NOT NULL DEFAULT 0,
+            last_cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            last_output_tokens      INTEGER NOT NULL DEFAULT 0,
+            last_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+            last_total_tokens       INTEGER NOT NULL DEFAULT 0,
+            context_tokens          INTEGER NOT NULL DEFAULT 0,
+            context_window          INTEGER NOT NULL DEFAULT 0,
+            updated_at              INTEGER NOT NULL,
+            PRIMARY KEY (room, agent)
+        );
         "#,
     )?;
     Ok(())
@@ -150,7 +176,12 @@ pub fn append(
     })
 }
 
-pub fn messages_after(conn: &Connection, room: &str, after: i64, limit: i64) -> Result<Vec<Message>> {
+pub fn messages_after(
+    conn: &Connection,
+    room: &str,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<Message>> {
     let mut stmt = conn.prepare(
         "SELECT seq,id,ts,room,sender,to_json,kind,body
          FROM messages WHERE room=?1 AND seq>?2 ORDER BY seq ASC LIMIT ?3",
@@ -171,13 +202,21 @@ pub fn history(conn: &Connection, room: &str, limit: i64) -> Result<Vec<Message>
 }
 
 pub fn max_seq(conn: &Connection, room: &str) -> Result<i64> {
-    let seq: Option<i64> =
-        conn.query_row("SELECT MAX(seq) FROM messages WHERE room=?1", params![room], |r| r.get(0))?;
+    let seq: Option<i64> = conn.query_row(
+        "SELECT MAX(seq) FROM messages WHERE room=?1",
+        params![room],
+        |r| r.get(0),
+    )?;
     Ok(seq.unwrap_or(0))
 }
 
 /// Recent messages sent by `sender`, newest first (used to re-surface an unanswered @).
-pub fn messages_from(conn: &Connection, room: &str, sender: &str, limit: i64) -> Result<Vec<Message>> {
+pub fn messages_from(
+    conn: &Connection,
+    room: &str,
+    sender: &str,
+    limit: i64,
+) -> Result<Vec<Message>> {
     let mut stmt = conn.prepare(
         "SELECT seq,id,ts,room,sender,to_json,kind,body
          FROM messages WHERE room=?1 AND sender=?2 ORDER BY seq DESC LIMIT ?3",
@@ -279,7 +318,13 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
 
 // ---- obligation graph: `debtor` owes `creditor` a reply (to message `msg_id`) ----
 
-pub fn add_obligation(conn: &Connection, room: &str, debtor: &str, creditor: &str, msg_id: &str) -> Result<()> {
+pub fn add_obligation(
+    conn: &Connection,
+    room: &str,
+    debtor: &str,
+    creditor: &str,
+    msg_id: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO obligations (room, debtor, creditor, msg_id, ts) VALUES (?1,?2,?3,?4,?5)",
         params![room, debtor, creditor, msg_id, now_ms()],
@@ -315,16 +360,17 @@ pub fn has_obligation(conn: &Connection, room: &str, debtor: &str, creditor: &st
 
 /// The creditors that `debtor` currently owes a reply to.
 pub fn owes(conn: &Connection, room: &str, debtor: &str) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT creditor FROM obligations WHERE room=?1 AND debtor=?2 ORDER BY ts ASC")?;
+    let mut stmt = conn
+        .prepare("SELECT creditor FROM obligations WHERE room=?1 AND debtor=?2 ORDER BY ts ASC")?;
     let rows = stmt.query_map(params![room, debtor], |r| r.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// What `debtor` owes, as (creditor, originating message id) pairs.
 pub fn owed_with_msg(conn: &Connection, room: &str, debtor: &str) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn
-        .prepare("SELECT creditor, msg_id FROM obligations WHERE room=?1 AND debtor=?2 ORDER BY ts ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT creditor, msg_id FROM obligations WHERE room=?1 AND debtor=?2 ORDER BY ts ASC",
+    )?;
     let rows = stmt.query_map(params![room, debtor], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -346,7 +392,9 @@ pub fn message_by_id(conn: &Connection, room: &str, id: &str) -> Result<Option<M
 pub fn all_obligations(conn: &Connection, room: &str) -> Result<Vec<(String, String)>> {
     let mut stmt =
         conn.prepare("SELECT debtor, creditor FROM obligations WHERE room=?1 ORDER BY ts ASC")?;
-    let rows = stmt.query_map(params![room], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map(params![room], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -372,9 +420,8 @@ fn employee_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Employee> {
 }
 
 pub fn get_employee(conn: &Connection, room: &str, name: &str) -> Result<Option<Employee>> {
-    let mut stmt = conn.prepare(
-        "SELECT name,spec,state,ts FROM employees WHERE room=?1 AND name=?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT name,spec,state,ts FROM employees WHERE room=?1 AND name=?2")?;
     let mut rows = stmt.query_map(params![room, name], employee_from_row)?;
     match rows.next() {
         Some(r) => Ok(Some(r?)),
@@ -389,7 +436,12 @@ pub fn list_employees(conn: &Connection, room: &str) -> Result<Vec<Employee>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-pub fn create_employee(conn: &Connection, room: &str, name: &str, spec: &serde_json::Value) -> Result<()> {
+pub fn create_employee(
+    conn: &Connection,
+    room: &str,
+    name: &str,
+    spec: &serde_json::Value,
+) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO employees (room,name,spec,state,ts) VALUES (?1,?2,?3,'requested',?4)",
         params![room, name, spec.to_string(), now_ms()],
@@ -405,6 +457,184 @@ pub fn set_employee_state(conn: &Connection, room: &str, name: &str, state: &str
     Ok(())
 }
 
+// ---- usage snapshots: latest token counters per agent ----
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UsageSnapshot {
+    pub agent: String,
+    pub backend: String,
+    pub model: Option<String>,
+    pub source: String,
+    pub session_id: Option<String>,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+    pub last_input_tokens: i64,
+    pub last_cached_input_tokens: i64,
+    pub last_output_tokens: i64,
+    pub last_reasoning_output_tokens: i64,
+    pub last_total_tokens: i64,
+    pub context_tokens: i64,
+    pub context_window: i64,
+    pub updated_at: i64,
+}
+
+fn usage_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageSnapshot> {
+    Ok(UsageSnapshot {
+        agent: row.get(0)?,
+        backend: row.get(1)?,
+        model: row.get(2)?,
+        source: row.get(3)?,
+        session_id: row.get(4)?,
+        input_tokens: row.get(5)?,
+        cached_input_tokens: row.get(6)?,
+        output_tokens: row.get(7)?,
+        reasoning_output_tokens: row.get(8)?,
+        total_tokens: row.get(9)?,
+        last_input_tokens: row.get(10)?,
+        last_cached_input_tokens: row.get(11)?,
+        last_output_tokens: row.get(12)?,
+        last_reasoning_output_tokens: row.get(13)?,
+        last_total_tokens: row.get(14)?,
+        context_tokens: row.get(15)?,
+        context_window: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
+}
+
+fn token_i64(v: &serde_json::Value, key: &str) -> i64 {
+    v.get(key).and_then(|x| x.as_i64()).unwrap_or(0).max(0)
+}
+
+fn token_string(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+pub fn upsert_usage(
+    conn: &Connection,
+    room: &str,
+    agent: &str,
+    payload: &serde_json::Value,
+) -> Result<UsageSnapshot> {
+    let total = payload.get("total").unwrap_or(payload);
+    let last = payload.get("last").unwrap_or(&serde_json::Value::Null);
+
+    let input_tokens = token_i64(total, "input_tokens");
+    let cached_input_tokens = token_i64(total, "cached_input_tokens");
+    let output_tokens = token_i64(total, "output_tokens");
+    let reasoning_output_tokens = token_i64(total, "reasoning_output_tokens");
+    let mut total_tokens = token_i64(total, "total_tokens");
+    if total_tokens == 0 {
+        total_tokens = input_tokens + cached_input_tokens + output_tokens + reasoning_output_tokens;
+    }
+
+    let last_input_tokens = token_i64(last, "input_tokens");
+    let last_cached_input_tokens = token_i64(last, "cached_input_tokens");
+    let last_output_tokens = token_i64(last, "output_tokens");
+    let last_reasoning_output_tokens = token_i64(last, "reasoning_output_tokens");
+    let mut last_total_tokens = token_i64(last, "total_tokens");
+    if last_total_tokens == 0 {
+        last_total_tokens = last_input_tokens
+            + last_cached_input_tokens
+            + last_output_tokens
+            + last_reasoning_output_tokens;
+    }
+    let context_tokens = token_i64(payload, "context_tokens").max(last_total_tokens);
+    let context_window = token_i64(payload, "context_window");
+    let backend = token_string(payload, "backend").unwrap_or_default();
+    let model = token_string(payload, "model");
+    let source = token_string(payload, "source").unwrap_or_default();
+    let session_id = token_string(payload, "session_id");
+    let updated_at = now_ms();
+
+    conn.execute(
+        "INSERT INTO usage_snapshots (
+            room,agent,backend,model,source,session_id,
+            input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,
+            last_input_tokens,last_cached_input_tokens,last_output_tokens,last_reasoning_output_tokens,last_total_tokens,
+            context_tokens,context_window,updated_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+         ON CONFLICT(room, agent) DO UPDATE SET
+            backend=excluded.backend,
+            model=excluded.model,
+            source=excluded.source,
+            session_id=excluded.session_id,
+            input_tokens=excluded.input_tokens,
+            cached_input_tokens=excluded.cached_input_tokens,
+            output_tokens=excluded.output_tokens,
+            reasoning_output_tokens=excluded.reasoning_output_tokens,
+            total_tokens=excluded.total_tokens,
+            last_input_tokens=excluded.last_input_tokens,
+            last_cached_input_tokens=excluded.last_cached_input_tokens,
+            last_output_tokens=excluded.last_output_tokens,
+            last_reasoning_output_tokens=excluded.last_reasoning_output_tokens,
+            last_total_tokens=excluded.last_total_tokens,
+            context_tokens=excluded.context_tokens,
+            context_window=excluded.context_window,
+            updated_at=excluded.updated_at",
+        params![
+            room,
+            agent,
+            backend,
+            model,
+            source,
+            session_id,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+            last_input_tokens,
+            last_cached_input_tokens,
+            last_output_tokens,
+            last_reasoning_output_tokens,
+            last_total_tokens,
+            context_tokens,
+            context_window,
+            updated_at,
+        ],
+    )?;
+
+    Ok(UsageSnapshot {
+        agent: agent.to_string(),
+        backend,
+        model,
+        source,
+        session_id,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+        last_input_tokens,
+        last_cached_input_tokens,
+        last_output_tokens,
+        last_reasoning_output_tokens,
+        last_total_tokens,
+        context_tokens,
+        context_window,
+        updated_at,
+    })
+}
+
+pub fn usage(conn: &Connection, room: &str) -> Result<Vec<UsageSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent,backend,model,source,session_id,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,
+                last_input_tokens,last_cached_input_tokens,last_output_tokens,last_reasoning_output_tokens,last_total_tokens,
+                context_tokens,context_window,updated_at
+         FROM usage_snapshots WHERE room=?1 ORDER BY total_tokens DESC, agent ASC",
+    )?;
+    let rows = stmt.query_map(params![room], usage_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Forget everything persisted about a room: its message log, roster, obligation
 /// graph, and desired-employee roster. Used on an explicit (re)start or close so
 /// leftover rows from a previous team on the same workspace can never shadow a
@@ -414,5 +644,6 @@ pub fn clear_room(conn: &Connection, room: &str) -> Result<()> {
     conn.execute("DELETE FROM agents WHERE room=?1", params![room])?;
     conn.execute("DELETE FROM obligations WHERE room=?1", params![room])?;
     conn.execute("DELETE FROM employees WHERE room=?1", params![room])?;
+    conn.execute("DELETE FROM usage_snapshots WHERE room=?1", params![room])?;
     Ok(())
 }

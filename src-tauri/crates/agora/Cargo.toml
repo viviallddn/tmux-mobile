@@ -35,10 +35,5 @@ schemars = "1"
 
 # Web layer: HTTP MCP mount + dashboard + SSE + human API
 axum = "0.8"
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 http = "1"
-
-[dev-dependencies]
-tempfile = "3"
-# web_test.rs drives the axum router over a real socket.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

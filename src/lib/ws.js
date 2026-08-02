@@ -583,10 +583,12 @@ export const teamTeams = () => call('team_teams');
 export const teamHistory = (room, limit = 100) => call('team_history', { room, limit });
 export const teamRoster = (room) => call('team_roster', { room });
 export const teamEmployees = (room) => call('team_employees', { room });
+export const teamUsage = (room) => call('team_usage', { room });
 export const teamPost = (room, body, requires_reply) => call('team_post', { room, body, requires_reply });
 // Operator actions: spin up a team for a workspace (room = its slug) from a
-// named roster template, or close one.
+// named roster template, clone the active room, or close one.
 export const teamStartTeam = (workspace, template) => call('team_start_team', { workspace, template });
+export const teamCloneTeam = (room) => call('team_clone_team', { room });
 export const teamCloseTeam = (room) => call('team_close_team', { room });
 // Roster templates (named agent rosters; edited in the Templates settings panel).
 export const teamTemplates = () => call('team_templates');

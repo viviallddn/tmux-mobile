@@ -12,7 +12,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Message kind. Agents always post `Msg`; the others are bus-generated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// A normal message posted by a participant.

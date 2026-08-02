@@ -1,7 +1,7 @@
 <script>
   // Team roster template editor (modal). Lists named templates; the selected
   // one's agents are editable in full (name, backend, role, goal, model,
-  // manage). Add/remove agents, add/rename/delete templates, save.
+  // manage). Add/remove agents, add/clone/rename/delete templates, save.
   // Persists via onSave(name, agents) / onDelete(name) which call the team_*
   // template RPCs and re-fetch.
   import Icon from './Icon.svelte';
@@ -41,6 +41,18 @@
   let sel = $derived(drafts[selIdx] || null);
 
   function markDirty() { dirty = true; }
+
+  function uniqueTemplateName(base) {
+    const taken = new Set(drafts.map(d => d.name));
+    const safeBase = (base || 'team').replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'team';
+    let name = safeBase;
+    let n = 2;
+    while (taken.has(name)) {
+      name = `${safeBase}-${n}`;
+      n += 1;
+    }
+    return name;
+  }
 
   function addAgent() {
     if (!sel) return;
@@ -111,11 +123,19 @@
 
   function addTemplate() {
     // Unique default name.
-    let n = 1, name = 'team-a';
-    const taken = new Set(drafts.map(d => d.name));
+    let n = 1, name = uniqueTemplateName('team-a');
     const letters = 'abcdefghijklmnop';
-    while (taken.has(name)) { name = `team-${letters[n] || n}`; n++; }
+    while (drafts.some(d => d.name === name)) { name = uniqueTemplateName(`team-${letters[n] || n}`); n++; }
     drafts = [...drafts, { name, agents: [] }];
+    selIdx = drafts.length - 1;
+    dirty = true;
+  }
+
+  function cloneTemplate() {
+    if (!sel) return;
+    const copy = JSON.parse(JSON.stringify(sel));
+    copy.name = uniqueTemplateName(`${sel.name || 'team'}-copy`);
+    drafts = [...drafts, copy];
     selIdx = drafts.length - 1;
     dirty = true;
   }
@@ -204,6 +224,9 @@
         <button class="tpl-picker-item tpl-picker-new" onclick={() => { addTemplate(); pickerOpen = false; }}>
           <Icon name="plus" size={12} /> {t('teamNewTemplate')}
         </button>
+        <button class="tpl-picker-item tpl-picker-clone" disabled={!sel} onclick={() => { cloneTemplate(); pickerOpen = false; }}>
+          <Icon name="copy" size={12} /> {t('teamCloneTemplate')}
+        </button>
       </div>
     {/if}
   </div>
@@ -217,6 +240,7 @@
         </button>
       {/each}
       <button class="tpl-add" onclick={addTemplate}><Icon name="plus" size={12} /> {t('teamNewTemplate')}</button>
+      <button class="tpl-clone" disabled={!sel} onclick={cloneTemplate}><Icon name="copy" size={12} /> {t('teamCloneTemplate')}</button>
     </div>
 
     <!-- Right: selected template's agents -->
@@ -387,12 +411,13 @@
   }
   .tpl-item.active { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
   .tpl-count { color: var(--text3); font-size: 11px; }
-  .tpl-add {
+  .tpl-add, .tpl-clone {
     padding: 7px 9px; border: 1px dashed var(--border2); border-radius: 8px;
     background: transparent; color: var(--text3); font-size: 12px; cursor: pointer;
     display: flex; align-items: center; gap: 5px; -webkit-tap-highlight-color: transparent;
   }
-  .tpl-add:active { color: var(--accent); border-color: var(--accent); }
+  .tpl-add:active, .tpl-clone:active:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+  .tpl-clone:disabled { opacity: 0.45; cursor: default; }
 
   /* Mobile template dropdown — hidden on desktop (the sidebar list is used). */
   .tpl-picker { display: none; }
@@ -418,7 +443,8 @@
     text-align: left; -webkit-tap-highlight-color: transparent; font-family: var(--font-ui);
   }
   .tpl-picker-item.active { color: var(--accent); background: var(--accent-bg); }
-  .tpl-picker-new { color: var(--text3); border-top: 1px solid var(--border2); border-radius: 0; margin-top: 2px; }
+  .tpl-picker-new, .tpl-picker-clone { color: var(--text3); border-top: 1px solid var(--border2); border-radius: 0; margin-top: 2px; }
+  .tpl-picker-item:disabled { opacity: 0.45; cursor: default; }
 
   .tpl-edit { flex: 1; min-width: 0; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
   .tpl-name-input {

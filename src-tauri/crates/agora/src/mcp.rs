@@ -98,7 +98,8 @@ fn identity(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    bus.join(&name, role.as_deref()).map_err(|e| err(format!("join failed: {e}")))?;
+    bus.join(&name, role.as_deref())
+        .map_err(|e| err(format!("join failed: {e}")))?;
     Ok((bus, name))
 }
 
@@ -153,7 +154,10 @@ fn render_roster(roster: &[crate::store::AgentRow]) -> String {
 #[tool_router]
 impl AgoraMcp {
     pub fn new(provider: std::sync::Arc<dyn BusProvider>) -> Self {
-        Self { provider, tool_router: Self::tool_router() }
+        Self {
+            provider,
+            tool_router: Self::tool_router(),
+        }
     }
 
     #[tool(
@@ -193,16 +197,24 @@ impl AgoraMcp {
             .await
             .map_err(|e| err(format!("wait failed: {e}")))?;
         let text = match outcome {
-            WaitOutcome::Delivered { messages, roster, .. } => {
+            WaitOutcome::Delivered {
+                messages, roster, ..
+            } => {
                 let lines: Vec<String> = messages.iter().map(|m| render_msg(m, &me)).collect();
-                format!("New messages:\n{}\n\n{}", lines.join("\n"), render_roster(&roster))
+                format!(
+                    "New messages:\n{}\n\n{}",
+                    lines.join("\n"),
+                    render_roster(&roster)
+                )
             }
             WaitOutcome::Idle { roster, .. } => {
                 format!("(no new messages)\n{}", render_roster(&roster))
             }
             WaitOutcome::Blocked { you_owe, pending } => {
-                let lines: Vec<String> =
-                    pending.iter().map(|m| format!("- {}: {}", m.from, m.body)).collect();
+                let lines: Vec<String> = pending
+                    .iter()
+                    .map(|m| format!("- {}: {}", m.from, m.body))
+                    .collect();
                 format!(
                     "You still owe a reply to {}. Reply with `post` first, then wait. Awaiting your reply:\n{}",
                     you_owe.join(", "),
@@ -213,14 +225,18 @@ impl AgoraMcp {
         Ok(text)
     }
 
-    #[tool(description = "List everyone present and their status. (Also included in every \
-        `wait` result, so rarely needed on its own.)")]
+    #[tool(
+        description = "List everyone present and their status. (Also included in every \
+        `wait` result, so rarely needed on its own.)"
+    )]
     async fn list_agents(
         &self,
         Extension(parts): Extension<http::request::Parts>,
     ) -> Result<String, ErrorData> {
         let (bus, _) = identity(&*self.provider, &parts)?;
-        let roster = bus.roster().map_err(|e| err(format!("roster failed: {e}")))?;
+        let roster = bus
+            .roster()
+            .map_err(|e| err(format!("roster failed: {e}")))?;
         Ok(render_roster(&roster))
     }
 
@@ -232,9 +248,15 @@ impl AgoraMcp {
     ) -> Result<String, ErrorData> {
         let (bus, me) = identity(&*self.provider, &parts)?;
         let limit = args.limit.unwrap_or(50).clamp(1, 1000);
-        let msgs = bus.history(limit).map_err(|e| err(format!("history failed: {e}")))?;
+        let msgs = bus
+            .history(limit)
+            .map_err(|e| err(format!("history failed: {e}")))?;
         let lines: Vec<String> = msgs.iter().map(|m| render_msg(m, &me)).collect();
-        Ok(if lines.is_empty() { "(no history)".to_string() } else { lines.join("\n") })
+        Ok(if lines.is_empty() {
+            "(no history)".to_string()
+        } else {
+            lines.join("\n")
+        })
     }
 
     #[tool(
@@ -255,7 +277,9 @@ impl AgoraMcp {
         Ok(msg.body)
     }
 
-    #[tool(description = "Manager only. Disable (fire) an employee by name; its agent process is stopped.")]
+    #[tool(
+        description = "Manager only. Disable (fire) an employee by name; its agent process is stopped."
+    )]
     async fn fire(
         &self,
         Extension(parts): Extension<http::request::Parts>,
@@ -271,7 +295,9 @@ impl AgoraMcp {
     /// Whether the calling agent (resolved from the x-agent/x-room headers) may
     /// manage — i.e. carries `manage` in its employee spec. Gates hire/fire.
     fn caller_can_manage(&self, ctx: &RequestContext<RoleServer>) -> bool {
-        let Some(parts) = ctx.extensions.get::<http::request::Parts>() else { return false };
+        let Some(parts) = ctx.extensions.get::<http::request::Parts>() else {
+            return false;
+        };
         let Some(name) = parts
             .headers
             .get("x-agent")
@@ -355,11 +381,22 @@ mod tests {
         // hire/fire visibility/permission keys off the employee `manage` flag, so
         // a template with no manage=true agent exposes neither tool to anyone.
         let bus = Bus::new(store::open_in_memory().unwrap(), "main");
-        bus.seed_employee("boss", &serde_json::json!({ "manage": true })).unwrap();
-        bus.seed_employee("worker", &serde_json::json!({ "manage": false })).unwrap();
+        bus.seed_employee("boss", &serde_json::json!({ "manage": true }))
+            .unwrap();
+        bus.seed_employee("worker", &serde_json::json!({ "manage": false }))
+            .unwrap();
         let provider = SingleRoom(bus);
-        assert!(agent_can_manage(&provider, "main", "boss"), "manager may hire/fire");
-        assert!(!agent_can_manage(&provider, "main", "worker"), "worker may not");
-        assert!(!agent_can_manage(&provider, "main", "ghost"), "unseeded caller may not");
+        assert!(
+            agent_can_manage(&provider, "main", "boss"),
+            "manager may hire/fire"
+        );
+        assert!(
+            !agent_can_manage(&provider, "main", "worker"),
+            "worker may not"
+        );
+        assert!(
+            !agent_can_manage(&provider, "main", "ghost"),
+            "unseeded caller may not"
+        );
     }
 }

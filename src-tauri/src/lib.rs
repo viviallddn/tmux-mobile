@@ -6,9 +6,9 @@ pub mod tmux;
 // team multi-agent bus bridge + in-process team supervisor — desktop only
 // (Android/iOS never build team).
 #[cfg(all(desktop, not(any(target_os = "android", target_os = "ios"))))]
-pub mod team_bridge;
-#[cfg(all(desktop, not(any(target_os = "android", target_os = "ios"))))]
 pub mod team;
+#[cfg(all(desktop, not(any(target_os = "android", target_os = "ios"))))]
+pub mod team_bridge;
 
 #[cfg(desktop)]
 use config::Config;
@@ -73,7 +73,10 @@ fn delete_download(name: String) -> Result<(), String> {
 #[tauri::command]
 fn get_download_path(name: String) -> Result<String, String> {
     let safe_name = sanitize_filename(&name)?;
-    Ok(format!("/storage/emulated/0/Download/TmuxMobile/{}", safe_name))
+    Ok(format!(
+        "/storage/emulated/0/Download/TmuxMobile/{}",
+        safe_name
+    ))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -91,15 +94,37 @@ pub fn run() {
                 let team: server::OptTeam = {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     {
-                        match team_bridge::TeamManager::start(&cfg.team_db, &cfg.team_room, &cfg.team_bind, &cfg.team_model) {
+                        match team_bridge::TeamManager::start(
+                            &cfg.team_db,
+                            &cfg.team_room,
+                            &cfg.team_bind,
+                            &cfg.team_model,
+                        ) {
                             Ok(b) => Some(b as std::sync::Arc<dyn server::TeamBridge>),
-                            Err(e) => { eprintln!("⚠️  team bus failed to start: {}", e); None }
+                            Err(e) => {
+                                eprintln!("⚠️  team bus failed to start: {}", e);
+                                None
+                            }
                         }
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
-                    { None }
+                    {
+                        None
+                    }
                 };
-                if let Err(e) = server::start_with_socket(&cfg.host, cfg.port, &cfg.token, &cfg.machine_id, cfg.tmux_socket, cfg.tls_cert, cfg.tls_key, cfg.disconnect_grace_secs, team).await {
+                if let Err(e) = server::start_with_socket(
+                    &cfg.host,
+                    cfg.port,
+                    &cfg.token,
+                    &cfg.machine_id,
+                    cfg.tmux_socket,
+                    cfg.tls_cert,
+                    cfg.tls_key,
+                    cfg.disconnect_grace_secs,
+                    team,
+                )
+                .await
+                {
                     eprintln!("Server error: {}", e);
                 }
             });
@@ -110,7 +135,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![get_local_config, save_to_downloads, list_downloads, delete_download, get_download_path])
+        .invoke_handler(tauri::generate_handler![
+            get_local_config,
+            save_to_downloads,
+            list_downloads,
+            delete_download,
+            get_download_path
+        ])
         .setup(|app| {
             // Desktop: build a custom menu WITHOUT the default View → Zoom
             // items.
@@ -127,34 +158,49 @@ pub fn run() {
             // adjusts the terminal font size and refits xterm correctly.
             #[cfg(target_os = "macos")]
             {
-                use tauri::menu::{Menu, Submenu, PredefinedMenuItem as P};
+                use tauri::menu::{Menu, PredefinedMenuItem as P, Submenu};
                 let pkg = &app.package_info().name;
-                let app_menu = Submenu::with_items(app, pkg, true, &[
-                    &P::about(app, None, None)?,
-                    &P::separator(app)?,
-                    &P::services(app, None)?,
-                    &P::separator(app)?,
-                    &P::hide(app, None)?,
-                    &P::hide_others(app, None)?,
-                    &P::show_all(app, None)?,
-                    &P::separator(app)?,
-                    &P::quit(app, None)?,
-                ])?;
-                let edit_menu = Submenu::with_items(app, "Edit", true, &[
-                    &P::undo(app, None)?,
-                    &P::redo(app, None)?,
-                    &P::separator(app)?,
-                    &P::cut(app, None)?,
-                    &P::copy(app, None)?,
-                    &P::paste(app, None)?,
-                    &P::select_all(app, None)?,
-                ])?;
-                let window_menu = Submenu::with_items(app, "Window", true, &[
-                    &P::minimize(app, None)?,
-                    &P::maximize(app, None)?,
-                    &P::separator(app)?,
-                    &P::close_window(app, None)?,
-                ])?;
+                let app_menu = Submenu::with_items(
+                    app,
+                    pkg,
+                    true,
+                    &[
+                        &P::about(app, None, None)?,
+                        &P::separator(app)?,
+                        &P::services(app, None)?,
+                        &P::separator(app)?,
+                        &P::hide(app, None)?,
+                        &P::hide_others(app, None)?,
+                        &P::show_all(app, None)?,
+                        &P::separator(app)?,
+                        &P::quit(app, None)?,
+                    ],
+                )?;
+                let edit_menu = Submenu::with_items(
+                    app,
+                    "Edit",
+                    true,
+                    &[
+                        &P::undo(app, None)?,
+                        &P::redo(app, None)?,
+                        &P::separator(app)?,
+                        &P::cut(app, None)?,
+                        &P::copy(app, None)?,
+                        &P::paste(app, None)?,
+                        &P::select_all(app, None)?,
+                    ],
+                )?;
+                let window_menu = Submenu::with_items(
+                    app,
+                    "Window",
+                    true,
+                    &[
+                        &P::minimize(app, None)?,
+                        &P::maximize(app, None)?,
+                        &P::separator(app)?,
+                        &P::close_window(app, None)?,
+                    ],
+                )?;
                 let menu = Menu::with_items(app, &[&app_menu, &edit_menu, &window_menu])?;
                 app.set_menu(menu)?;
             }

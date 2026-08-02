@@ -29,15 +29,30 @@ fn list_dir_classifies_symlinks() {
 
     let entries = rfs::list_dir(root.to_str().unwrap(), false).unwrap();
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert!(names.contains(&"link-to-dir"), "missing link-to-dir; got {:?}", names);
-    assert!(names.contains(&"link-to-file"), "missing link-to-file; got {:?}", names);
-    assert!(names.contains(&"broken-link"), "broken symlink not surfaced; got {:?}", names);
+    assert!(
+        names.contains(&"link-to-dir"),
+        "missing link-to-dir; got {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"link-to-file"),
+        "missing link-to-file; got {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"broken-link"),
+        "broken symlink not surfaced; got {:?}",
+        names
+    );
 
     let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
 
     let ld = by_name("link-to-dir");
     assert!(ld.is_symlink, "link-to-dir should be flagged as symlink");
-    assert_eq!(ld.file_type, "dir", "symlink-to-dir should report target type 'dir' for navigation");
+    assert_eq!(
+        ld.file_type, "dir",
+        "symlink-to-dir should report target type 'dir' for navigation"
+    );
     assert!(ld.link_target.ends_with("real-dir"));
 
     let lf = by_name("link-to-file");
@@ -47,7 +62,10 @@ fn list_dir_classifies_symlinks() {
 
     let bl = by_name("broken-link");
     assert!(bl.is_symlink);
-    assert_eq!(bl.file_type, "broken", "dangling symlinks should be marked broken");
+    assert_eq!(
+        bl.file_type, "broken",
+        "dangling symlinks should be marked broken"
+    );
 }
 
 #[test]
@@ -67,7 +85,8 @@ fn list_dir_preserves_symlink_path() {
     assert!(
         p.starts_with(&expected_prefix),
         "entry path {} should be under symlink path {}, not the canonical target",
-        p, expected_prefix
+        p,
+        expected_prefix
     );
 }
 
@@ -81,7 +100,10 @@ fn stat_file_flags_symlink_and_keeps_path() {
     let stat = rfs::stat_file(&link_str).unwrap();
     assert!(stat.is_symlink, "stat should flag symlink");
     assert_eq!(stat.file_type, "dir");
-    assert_eq!(stat.path, link_str, "stat should preserve user-supplied path");
+    assert_eq!(
+        stat.path, link_str,
+        "stat should preserve user-supplied path"
+    );
     assert!(stat.link_target.ends_with("real"));
 }
 

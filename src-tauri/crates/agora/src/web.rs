@@ -9,8 +9,9 @@
 //! - `GET  /api/roster`     — roster + presence
 //! - `GET  /api/quiescence` — done / deadlock / active classification
 //! - `GET  /api/history`    — recent messages
+//! - `POST /api/usage`      — agent token-usage snapshot ingest
 
-use crate::bus::Bus;
+use crate::bus::{Bus, WaitOutcome};
 use crate::mcp::AgoraMcp;
 use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -64,7 +65,10 @@ pub fn router(provider: Arc<dyn crate::bus::BusProvider>) -> Router {
             move || Ok(AgoraMcp::new(provider.clone()))
         },
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig { stateful_mode: false, ..Default::default() },
+        StreamableHttpServerConfig {
+            stateful_mode: false,
+            ..Default::default()
+        },
     );
 
     Router::new()
@@ -76,6 +80,9 @@ pub fn router(provider: Arc<dyn crate::bus::BusProvider>) -> Router {
         .route("/api/history", get(api_history))
         .route("/api/employees", get(api_employees).post(api_seed_employee))
         .route("/api/heartbeat", post(api_heartbeat))
+        .route("/api/usage", post(api_usage))
+        .route("/api/agent/wait", get(api_agent_wait))
+        .route("/api/agent/post", post(api_agent_post))
         .nest_service("/mcp", mcp_service)
         .with_state(AppState { provider })
 }
@@ -104,10 +111,16 @@ async fn dashboard() -> Html<&'static str> {
 
 /// Live message stream for the dashboard. Replays recent history, then streams
 /// new messages for the `?room=` room (default room if omitted).
-async fn sse(State(st): State<AppState>, Query(q): Query<RoomQuery>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+async fn sse(
+    State(st): State<AppState>,
+    Query(q): Query<RoomQuery>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     // Fall back to the default room's bus if the requested room is unknown, so
     // the dashboard SSE never 500s; an empty stream is fine.
-    let bus = st.bus(&q.room).or_else(|| st.bus(&None)).expect("default room must exist");
+    let bus = st
+        .bus(&q.room)
+        .or_else(|| st.bus(&None))
+        .expect("default room must exist");
     let rx = bus.subscribe();
     let history = bus.history(100).unwrap_or_default();
 
@@ -149,7 +162,9 @@ struct PostBody {
 }
 
 async fn api_post(State(st): State<AppState>, Json(b): Json<PostBody>) -> axum::response::Response {
-    let Some(bus) = st.bus(&b.room) else { return ERR_NO_ROOM.into_response() };
+    let Some(bus) = st.bus(&b.room) else {
+        return ERR_NO_ROOM.into_response();
+    };
     let from = b.from.unwrap_or_else(|| "human".to_string());
     let rr = b.requires_reply.unwrap_or_else(|| b.body.contains('@'));
     match bus.post(&from, &b.body, rr) {
@@ -162,35 +177,229 @@ async fn api_post(State(st): State<AppState>, Json(b): Json<PostBody>) -> axum::
 /// heads-down working agent keeps a fresh `last_seen` instead of decaying to
 /// `unreachable`. Identity comes from the same headers agents send to `/mcp`:
 /// `x-agent` (who) + `x-room` (which team). Best-effort: always 204.
-async fn api_heartbeat(State(st): State<AppState>, headers: axum::http::HeaderMap) -> axum::response::Response {
-    let hdr = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    let agent = hdr("x-agent").unwrap_or_default();
-    if agent.is_empty() {
+async fn api_heartbeat(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let Ok((agent, room, role)) = agent_identity(&headers) else {
         return (axum::http::StatusCode::BAD_REQUEST, "missing x-agent").into_response();
-    }
-    let Some(bus) = st.bus(&hdr("x-room")) else { return ERR_NO_ROOM.into_response() };
-    let _ = bus.heartbeat(&agent);
+    };
+    let Some(bus) = st.bus(&room) else {
+        return ERR_NO_ROOM.into_response();
+    };
+    let _ = bus.heartbeat(&agent, role.as_deref());
     axum::http::StatusCode::NO_CONTENT.into_response()
 }
 
-async fn api_roster(State(st): State<AppState>, Query(q): Query<RoomQuery>) -> axum::response::Response {
-    let Some(bus) = st.bus(&q.room) else { return ERR_NO_ROOM.into_response() };
+/// `POST /api/usage` — best-effort token usage ingest from per-agent hooks.
+/// Identity uses the same headers as `/mcp` and `/api/heartbeat`.
+async fn api_usage(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let Ok((agent, room, _role)) = agent_identity(&headers) else {
+        return (axum::http::StatusCode::BAD_REQUEST, "missing x-agent").into_response();
+    };
+    let Some(bus) = st.bus(&room) else {
+        return ERR_NO_ROOM.into_response();
+    };
+    match bus.record_usage(&agent, &body) {
+        Ok(_) => axum::http::StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentWaitQuery {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// `full` preserves the original WaitOutcome shape. Shell fallback agents
+    /// use `compact` to avoid dumping full AgentRow metadata into every CLI
+    /// transcript; `none` omits roster entirely.
+    #[serde(default)]
+    roster: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitRosterMode {
+    Full,
+    Compact,
+    None,
+}
+
+impl WaitRosterMode {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.unwrap_or("full").to_ascii_lowercase().as_str() {
+            "compact" => WaitRosterMode::Compact,
+            "none" | "off" | "false" | "0" => WaitRosterMode::None,
+            _ => WaitRosterMode::Full,
+        }
+    }
+}
+
+fn agent_identity(
+    headers: &axum::http::HeaderMap,
+) -> Result<(String, Option<String>, Option<String>), axum::response::Response> {
+    let hdr = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+    };
+    let agent = hdr("x-agent")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| (axum::http::StatusCode::BAD_REQUEST, "missing x-agent").into_response())?;
+    let room = hdr("x-room").filter(|s| !s.is_empty());
+    let role = hdr("x-agent-role").filter(|s| !s.is_empty());
+    Ok((agent, room, role))
+}
+
+/// Shell-friendly fallback for agent CLIs whose MCP tools are not surfaced to
+/// the model. Identity comes from headers, matching `/mcp`.
+async fn api_agent_wait(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<AgentWaitQuery>,
+) -> axum::response::Response {
+    let Ok((agent, room, role)) = agent_identity(&headers) else {
+        return (axum::http::StatusCode::BAD_REQUEST, "missing x-agent").into_response();
+    };
+    let Some(bus) = st.bus(&room) else {
+        return ERR_NO_ROOM.into_response();
+    };
+    if let Err(e) = bus.join(&agent, role.as_deref()) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    match bus
+        .wait(&agent, q.timeout_ms.map(Duration::from_millis))
+        .await
+    {
+        Ok(outcome) => Json(wait_outcome_json(
+            outcome,
+            WaitRosterMode::parse(q.roster.as_deref()),
+        ))
+        .into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+fn wait_outcome_json(outcome: WaitOutcome, roster_mode: WaitRosterMode) -> serde_json::Value {
+    match outcome {
+        WaitOutcome::Delivered {
+            messages,
+            roster,
+            cursor,
+        } => {
+            let mut out = serde_json::json!({
+                "outcome": "delivered",
+                "messages": messages,
+                "cursor": cursor,
+            });
+            apply_roster_mode(&mut out, roster, roster_mode);
+            out
+        }
+        WaitOutcome::Idle { roster, cursor } => {
+            let mut out = serde_json::json!({
+                "outcome": "idle",
+                "cursor": cursor,
+            });
+            apply_roster_mode(&mut out, roster, roster_mode);
+            out
+        }
+        WaitOutcome::Blocked { you_owe, pending } => serde_json::json!({
+            "outcome": "blocked",
+            "you_owe": you_owe,
+            "pending": pending,
+        }),
+    }
+}
+
+fn apply_roster_mode(
+    out: &mut serde_json::Value,
+    roster: Vec<crate::store::AgentRow>,
+    roster_mode: WaitRosterMode,
+) {
+    match roster_mode {
+        WaitRosterMode::Full => {
+            out["roster"] = serde_json::to_value(roster).unwrap_or_else(|_| serde_json::json!([]));
+        }
+        WaitRosterMode::Compact => {
+            out["roster"] = serde_json::Value::Array(
+                roster
+                    .into_iter()
+                    .filter(|a| a.status != "offline")
+                    .map(|a| serde_json::json!({ "name": a.name, "status": a.status }))
+                    .collect(),
+            );
+        }
+        WaitRosterMode::None => {}
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentPostQuery {
+    #[serde(default)]
+    requires_reply: Option<bool>,
+}
+
+/// Shell-friendly fallback for posting to the team bus. The raw request body is
+/// the chat message, so callers don't need a JSON encoder.
+async fn api_agent_post(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<AgentPostQuery>,
+    body: String,
+) -> axum::response::Response {
+    let Ok((agent, room, role)) = agent_identity(&headers) else {
+        return (axum::http::StatusCode::BAD_REQUEST, "missing x-agent").into_response();
+    };
+    let Some(bus) = st.bus(&room) else {
+        return ERR_NO_ROOM.into_response();
+    };
+    if let Err(e) = bus.join(&agent, role.as_deref()) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let requires_reply = q.requires_reply.unwrap_or_else(|| body.contains('@'));
+    match bus.post(&agent, &body, requires_reply) {
+        Ok(m) => Json(m).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn api_roster(
+    State(st): State<AppState>,
+    Query(q): Query<RoomQuery>,
+) -> axum::response::Response {
+    let Some(bus) = st.bus(&q.room) else {
+        return ERR_NO_ROOM.into_response();
+    };
     match bus.roster() {
         Ok(r) => Json(r).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-async fn api_quiescence(State(st): State<AppState>, Query(q): Query<RoomQuery>) -> axum::response::Response {
-    let Some(bus) = st.bus(&q.room) else { return ERR_NO_ROOM.into_response() };
+async fn api_quiescence(
+    State(st): State<AppState>,
+    Query(q): Query<RoomQuery>,
+) -> axum::response::Response {
+    let Some(bus) = st.bus(&q.room) else {
+        return ERR_NO_ROOM.into_response();
+    };
     match bus.quiescence() {
         Ok(qx) => Json(qx).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-async fn api_employees(State(st): State<AppState>, Query(q): Query<RoomQuery>) -> axum::response::Response {
-    let Some(bus) = st.bus(&q.room) else { return ERR_NO_ROOM.into_response() };
+async fn api_employees(
+    State(st): State<AppState>,
+    Query(q): Query<RoomQuery>,
+) -> axum::response::Response {
+    let Some(bus) = st.bus(&q.room) else {
+        return ERR_NO_ROOM.into_response();
+    };
     match bus.employees() {
         Ok(e) => Json(e).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -208,16 +417,26 @@ struct SeedBody {
 
 /// Seed the desired roster with an employee (the dashboard / external HTTP API;
 /// the in-app path seeds directly via `Bus::seed_employee`).
-async fn api_seed_employee(State(st): State<AppState>, Json(b): Json<SeedBody>) -> axum::response::Response {
-    let Some(bus) = st.bus(&b.room) else { return ERR_NO_ROOM.into_response() };
+async fn api_seed_employee(
+    State(st): State<AppState>,
+    Json(b): Json<SeedBody>,
+) -> axum::response::Response {
+    let Some(bus) = st.bus(&b.room) else {
+        return ERR_NO_ROOM.into_response();
+    };
     match bus.seed_employee(&b.name, &b.spec) {
         Ok(()) => Json(serde_json::json!({"ok": true, "name": b.name})).into_response(),
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
-async fn api_history(State(st): State<AppState>, Query(q): Query<RoomQuery>) -> axum::response::Response {
-    let Some(bus) = st.bus(&q.room) else { return ERR_NO_ROOM.into_response() };
+async fn api_history(
+    State(st): State<AppState>,
+    Query(q): Query<RoomQuery>,
+) -> axum::response::Response {
+    let Some(bus) = st.bus(&q.room) else {
+        return ERR_NO_ROOM.into_response();
+    };
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     match bus.history(limit) {
         Ok(m) => Json(m).into_response(),
@@ -226,3 +445,101 @@ async fn api_history(State(st): State<AppState>, Query(q): Query<RoomQuery>) -> 
 }
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn agent_shell_api_joins_waits_and_posts_without_json_encoding() {
+        let conn = crate::store::open_in_memory().unwrap();
+        let bus = Bus::new(conn, "main");
+        let app = router_single(bus);
+
+        let wait_req = Request::builder()
+            .uri("/api/agent/wait?timeout_ms=1")
+            .header("x-agent", "manager")
+            .header("x-room", "main")
+            .header("x-agent-role", "tech lead")
+            .body(Body::empty())
+            .unwrap();
+        let wait_resp = app.clone().oneshot(wait_req).await.unwrap();
+        assert_eq!(wait_resp.status(), StatusCode::OK);
+        let wait_body = to_bytes(wait_resp.into_body(), 64 * 1024).await.unwrap();
+        let wait_json: serde_json::Value = serde_json::from_slice(&wait_body).unwrap();
+        assert_eq!(wait_json["outcome"], "idle");
+
+        let roster_req = Request::builder()
+            .uri("/api/roster")
+            .body(Body::empty())
+            .unwrap();
+        let roster_resp = app.clone().oneshot(roster_req).await.unwrap();
+        let roster_body = to_bytes(roster_resp.into_body(), 64 * 1024).await.unwrap();
+        let roster: Vec<serde_json::Value> = serde_json::from_slice(&roster_body).unwrap();
+        assert_eq!(roster[0]["name"], "manager");
+        assert_eq!(roster[0]["role"], "tech lead");
+
+        let post_req = Request::builder()
+            .method("POST")
+            .uri("/api/agent/post?requires_reply=false")
+            .header("x-agent", "manager")
+            .header("x-room", "main")
+            .body(Body::from("@human standing by"))
+            .unwrap();
+        let post_resp = app.oneshot(post_req).await.unwrap();
+        assert_eq!(post_resp.status(), StatusCode::OK);
+        let post_body = to_bytes(post_resp.into_body(), 64 * 1024).await.unwrap();
+        let post_json: serde_json::Value = serde_json::from_slice(&post_body).unwrap();
+        assert_eq!(post_json["from"], "manager");
+        assert_eq!(post_json["body"], "@human standing by");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_joins_requested_employee_before_wait() {
+        let conn = crate::store::open_in_memory().unwrap();
+        let bus = Bus::new(conn, "main");
+        bus.seed_employee(
+            "frontend",
+            &serde_json::json!({ "role": "frontend engineer" }),
+        )
+        .unwrap();
+        let app = router_single(bus);
+
+        let hb_req = Request::builder()
+            .method("POST")
+            .uri("/api/heartbeat")
+            .header("x-agent", "frontend")
+            .header("x-room", "main")
+            .header("x-agent-role", "frontend engineer")
+            .body(Body::empty())
+            .unwrap();
+        let hb_resp = app.clone().oneshot(hb_req).await.unwrap();
+        assert_eq!(hb_resp.status(), StatusCode::NO_CONTENT);
+
+        let roster_req = Request::builder()
+            .uri("/api/roster")
+            .body(Body::empty())
+            .unwrap();
+        let roster_resp = app.clone().oneshot(roster_req).await.unwrap();
+        let roster_body = to_bytes(roster_resp.into_body(), 64 * 1024).await.unwrap();
+        let roster: Vec<serde_json::Value> = serde_json::from_slice(&roster_body).unwrap();
+        assert_eq!(roster[0]["name"], "frontend");
+        assert_eq!(roster[0]["role"], "frontend engineer");
+        assert_eq!(roster[0]["status"], "working");
+
+        let employees_req = Request::builder()
+            .uri("/api/employees")
+            .body(Body::empty())
+            .unwrap();
+        let employees_resp = app.oneshot(employees_req).await.unwrap();
+        let employees_body = to_bytes(employees_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let employees: Vec<serde_json::Value> = serde_json::from_slice(&employees_body).unwrap();
+        assert_eq!(employees[0]["name"], "frontend");
+        assert_eq!(employees[0]["state"], "active");
+    }
+}

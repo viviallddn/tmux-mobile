@@ -435,3 +435,23 @@ hidden.
   needs `codex login`.
 - **History window**: the tab loads `team_history(200)`; the full log lives in
   SQLite.
+
+## 9. Markdown output viewer
+
+Team-produced `.md` files are clickable in the chat. When a message references a
+workspace-relative `.md` (either `[text](path.md)` or a bare `./path.md` in
+prose), `Team.svelte` rewrites it to `<view_base>/view?room=&path=` — a route
+on the SAME agora axum port (`team_bind`, default `127.0.0.1:8787`), added in
+host code (`src-tauri/src/team_view.rs`) and merged onto `agora::web::router`
+so the vendored crate stays untouched. Clicking opens the system browser (via
+App's global `a[href]` handler) and the route server-renders the file with
+`pulldown-cmark`; vendored highlight.js + mermaid (embedded via `include_str!`,
+served from `/view/assets/*`) run client-side.
+
+Security: `/view` inherits the port's **unauthenticated, localhost-only**
+posture. It resolves the workspace from `room` server-side, accepts only a
+relative `path`, canonicalize-prefix-checks it against the workspace, and
+allows only `.md`/`.markdown` under a 5 MB cap — so a localhost caller can never
+read outside a team's workspace. Keep `team_bind` on `127.0.0.1` on untrusted
+networks. The viewer is desktop-only (the phone cannot reach `:8787`); phone-
+side viewing would need the WS + in-app Files viewer, a separate design.

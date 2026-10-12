@@ -753,7 +753,7 @@
   //   2. bare paths typed in prose (agents often just say ./report.md)
   // Absolute URLs and non-.md refs are left untouched. DOM pass (not a string
   // rewrite) so the renderMarkdown memo cache stays valid across team switches.
-  const _MD_BARE = /(?<![\w/@.-])((?:\.\/)?(?:[\w.-]+\/)*[\w.-]+\.md)(#[\w-]+)?(?![\w/.-])/g;
+  const _MD_BARE = /(?<![\w/@.-])((?:\.\/)?(?:[\w.-]+\/)*[\w.-]+\.md)(#[\w-]+)?(?![\w/-])/g;
   function mdViewHref(room, rel) {
     const clean = rel.replace(/^\.\//, '');
     return `${viewBase}/view?room=${encodeURIComponent(room)}&path=${encodeURIComponent(clean)}`;
@@ -784,6 +784,7 @@
       let n;
       while ((n = walker.nextNode())) {
         if (n.parentElement && n.parentElement.closest('a,code,pre')) continue;
+        _MD_BARE.lastIndex = 0;
         if (_MD_BARE.test(n.nodeValue || '')) targets.push(n);
       }
       for (const node of targets) {

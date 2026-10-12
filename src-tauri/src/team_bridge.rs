@@ -767,6 +767,10 @@ impl TeamBridge for TeamManager {
         serde_json::json!({ "recent_workspaces": self.load_recent_workspaces() })
     }
 
+    fn view_base(&self) -> String {
+        self.cfg.url.clone()
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<String> {
         self.json_tx.subscribe()
     }

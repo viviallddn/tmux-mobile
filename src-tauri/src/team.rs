@@ -2741,6 +2741,9 @@ mod tests {
         fn recent_workspaces(&self) -> Value {
             serde_json::json!({ "recent_workspaces": [] })
         }
+        fn view_base(&self) -> String {
+            "http://127.0.0.1:8787".into()
+        }
         fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
             tokio::sync::broadcast::channel(1).1
         }

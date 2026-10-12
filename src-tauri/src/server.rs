@@ -104,6 +104,10 @@ pub trait TeamBridge: Send + Sync {
     /// Recently started team workspaces for one-click recreation:
     /// `{ "recent_workspaces": [{ workspace, template, room, last_started }] }`.
     fn recent_workspaces(&self) -> serde_json::Value;
+    /// Base URL of the local Markdown view service (same host:port as the Team
+    /// daemon, e.g. `http://127.0.0.1:8787`). The Team tab builds
+    /// `<view_base>/view?room=&path=` links from it.
+    fn view_base(&self) -> String;
     /// A receiver of newly-broadcast messages across ALL rooms, each
     /// pre-serialized to a JSON string (the `room` field is inside each
     /// message). The client filters to the team currently in view.
@@ -1056,6 +1060,7 @@ fn handle_team_request(req: &Request, team: Option<&dyn TeamBridge>) -> Response
                 "system_prompt": bus.system_prompt(),
                 "default_workspace": bus.default_workspace(),
                 "recent_workspaces": bus.recent_workspaces().get("recent_workspaces").cloned().unwrap_or(serde_json::json!([])),
+                "view_base": bus.view_base(),
             }),
         ),
         "team_teams" => Response::ok(id, bus.teams()),
@@ -2280,6 +2285,9 @@ mod tests {
                 }]
             })
         }
+        fn view_base(&self) -> String {
+            "http://127.0.0.1:8787".into()
+        }
         fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
             let (tx, rx) = tokio::sync::broadcast::channel(4);
             let _ = tx; // keep the sender alive only as long as needed for the type
@@ -2372,6 +2380,7 @@ mod tests {
         let s = r.result.unwrap();
         assert_eq!(s["available"], true);
         assert!(s["teams"].is_array());
+        assert_eq!(s["view_base"], "http://127.0.0.1:8787");
     }
 
     #[test]

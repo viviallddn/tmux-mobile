@@ -219,12 +219,17 @@ mod tests {
     #[test]
     fn view_sanitizes_dangerous_link_schemes() {
         let html = tmux_mobile::team_view::markdown_to_html(
-            "[x](javascript:alert(1)) [y](HTTP://ok/a.md) [z](./rel.md) [w](data:text/html,<x>) [m](mailto:a@b.c)\n",
+            "[x](javascript:alert(1)) [u](JavaScript:alert(2)) [v](vbscript:msgbox) \
+[f](file:///etc/passwd) [y](HTTP://ok/a.md) [z](./rel.md) [w](data:text/html,blah) [m](mailto:a@b.c)\n",
         );
-        assert!(!html.contains("javascript:"));
+        // dangerous schemes neutralized (case-insensitively)
+        assert!(!html.to_ascii_lowercase().contains("javascript:"));
+        assert!(!html.to_ascii_lowercase().contains("vbscript:"));
+        assert!(!html.contains("file:"));
         assert!(!html.contains("data:text/html"));
-        assert!(html.contains("href=\"HTTP://ok/a.md\"")); // allowed scheme kept verbatim
-        assert!(html.contains("href=\"./rel.md\""));        // relative kept
-        assert!(html.contains("href=\"mailto:a@b.c\""));    // mailto kept
+        // safe schemes / relative / mailto preserved
+        assert!(html.contains("href=\"HTTP://ok/a.md\""));
+        assert!(html.contains("href=\"./rel.md\""));
+        assert!(html.contains("href=\"mailto:a@b.c\""));
     }
 }

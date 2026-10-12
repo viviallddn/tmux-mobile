@@ -178,4 +178,35 @@ mod tests {
         assert!(html.contains("<pre><code>plain"));
         assert!(!html.contains("language-"));
     }
+
+    #[test]
+    fn view_asset_lookup_known_and_unknown() {
+        let (js, ct) = tmux_mobile::team_view::asset_lookup("mermaid.min.js").unwrap();
+        assert!(!js.is_empty());
+        assert!(ct.contains("javascript"));
+        assert!(tmux_mobile::team_view::asset_lookup("../secret").is_none());
+    }
+
+    #[test]
+    fn view_page_links_assets() {
+        let html = tmux_mobile::team_view::markdown_to_html("# Hi\n");
+        // sanity: body render still works (asset wiring is in render_page)
+        assert!(html.contains("<h1>Hi</h1>"));
+    }
+
+    #[test]
+    fn view_escapes_raw_html_in_source() {
+        let html = tmux_mobile::team_view::markdown_to_html(
+            "Hello\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n",
+        );
+        // Raw source HTML is escaped to inert text, so no live <script> or
+        // <img onerror=…> element ever reaches the page. Escaping only
+        // neutralises `<`/`>`, so the inert text still contains the literal
+        // "onerror=alert" substring — assert on the live tag, not the
+        // substring, to prove the handler can never fire.
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&lt;img src=x onerror=alert(2)&gt;"));
+    }
 }

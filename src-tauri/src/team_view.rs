@@ -4,7 +4,9 @@
 //! onto the agora axum router. `room → workspace` is resolved from the live
 //! `TeamManager`, and the client only ever passes a RELATIVE path — so this
 //! unauthenticated, localhost-only port can never read outside a team's
-//! workspace. Client-side highlight.js + mermaid assets are wired in Task 2.
+//! workspace. Raw HTML in the source markdown is escaped to inert text, and
+//! client-side highlight.js + mermaid assets are embedded and served from
+//! `GET /view/assets/<name>`.
 
 use crate::team_bridge::TeamManager;
 use axum::extract::{Query, State};
@@ -15,6 +17,21 @@ use axum::Router;
 use serde::Deserialize;
 use std::path::{Component, Path};
 use std::sync::Arc;
+
+// Vendored client assets (see assets/view/README.md for versions/sources).
+const HLJS_JS: &str = include_str!("../assets/view/highlight.min.js");
+const HLJS_CSS: &str = include_str!("../assets/view/github-dark.min.css");
+const MERMAID_JS: &str = include_str!("../assets/view/mermaid.min.js");
+
+/// `(body, content-type)` for a known asset name, else `None`.
+pub fn asset_lookup(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "highlight.min.js" => Some((HLJS_JS, "text/javascript; charset=utf-8")),
+        "github-dark.min.css" => Some((HLJS_CSS, "text/css; charset=utf-8")),
+        "mermaid.min.js" => Some((MERMAID_JS, "text/javascript; charset=utf-8")),
+        _ => None,
+    }
+}
 
 /// Reject files larger than this (rendered inline in a browser tab).
 pub(crate) const MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -28,6 +45,7 @@ struct ViewState {
 pub fn router(mgr: Arc<TeamManager>) -> Router {
     Router::new()
         .route("/view", get(view))
+        .route("/view/assets/{name}", get(asset))
         .with_state(ViewState { mgr })
 }
 
@@ -45,6 +63,13 @@ async fn view(State(st): State<ViewState>, Query(q): Query<ViewQuery>) -> Respon
     match render_markdown_file(&workspace, &q.path) {
         Ok(html) => Html(html).into_response(),
         Err(code) => (code, code.canonical_reason().unwrap_or("error")).into_response(),
+    }
+}
+
+async fn asset(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
+    match asset_lookup(&name) {
+        Some((body, ct)) => ([(axum::http::header::CONTENT_TYPE, ct)], body).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown asset").into_response(),
     }
 }
 
@@ -141,6 +166,13 @@ pub fn markdown_to_html(src: &str) -> String {
                 transformed.push(Event::Html(block.into()));
                 lang = None;
             }
+            // Agent-produced markdown is untrusted and shares the localhost
+            // origin with the unauthenticated team dashboard/MCP API. Render
+            // raw HTML from the SOURCE as inert escaped text. (Our highlight/
+            // mermaid scripts are injected by render_page, not here.)
+            Event::Html(h) | Event::InlineHtml(h) if !in_code => {
+                transformed.push(Event::Text(h));
+            }
             other => transformed.push(other),
         }
     }
@@ -162,8 +194,17 @@ fn render_page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-<title>{title}</title>\n<style>{css}</style>\n</head>\n\
-<body><main class=\"md\">{body}</main></body></html>\n",
+<title>{title}</title>\n\
+<link rel=\"stylesheet\" href=\"/view/assets/github-dark.min.css\">\n\
+<style>{css}</style>\n</head>\n\
+<body><main class=\"md\">{body}</main>\n\
+<script src=\"/view/assets/highlight.min.js\"></script>\n\
+<script src=\"/view/assets/mermaid.min.js\"></script>\n\
+<script>document.addEventListener('DOMContentLoaded',function(){{\
+if(window.hljs){{document.querySelectorAll('pre code').forEach(function(el){{window.hljs.highlightElement(el);}});}}\
+if(window.mermaid){{window.mermaid.initialize({{startOnLoad:true,theme:'dark',securityLevel:'strict'}});}}\
+}});</script>\n\
+</body></html>\n",
         title = html_escape(title),
         css = PAGE_CSS,
         body = body

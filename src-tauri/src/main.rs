@@ -189,9 +189,15 @@ mod tests {
 
     #[test]
     fn view_page_links_assets() {
-        let html = tmux_mobile::team_view::markdown_to_html("# Hi\n");
-        // sanity: body render still works (asset wiring is in render_page)
-        assert!(html.contains("<h1>Hi</h1>"));
+        let dir = std::env::temp_dir().join("tmm_view_assets");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.md"), "# Hi\n").unwrap();
+        let ws = dir.to_str().unwrap();
+        let html = tmux_mobile::team_view::render_markdown_file(ws, "p.md").unwrap();
+        assert!(html.contains("/view/assets/github-dark.min.css"));
+        assert!(html.contains("/view/assets/highlight.min.js"));
+        assert!(html.contains("/view/assets/mermaid.min.js"));
+        assert!(html.contains("securityLevel:'strict'"));
     }
 
     #[test]
@@ -208,5 +214,17 @@ mod tests {
         assert!(!html.contains("<img"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("&lt;img src=x onerror=alert(2)&gt;"));
+    }
+
+    #[test]
+    fn view_sanitizes_dangerous_link_schemes() {
+        let html = tmux_mobile::team_view::markdown_to_html(
+            "[x](javascript:alert(1)) [y](HTTP://ok/a.md) [z](./rel.md) [w](data:text/html,<x>) [m](mailto:a@b.c)\n",
+        );
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("data:text/html"));
+        assert!(html.contains("href=\"HTTP://ok/a.md\"")); // allowed scheme kept verbatim
+        assert!(html.contains("href=\"./rel.md\""));        // relative kept
+        assert!(html.contains("href=\"mailto:a@b.c\""));    // mailto kept
     }
 }

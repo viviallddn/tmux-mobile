@@ -173,6 +173,22 @@ pub fn markdown_to_html(src: &str) -> String {
             Event::Html(h) | Event::InlineHtml(h) if !in_code => {
                 transformed.push(Event::Text(h));
             }
+            // Untrusted markdown link destinations share the same unauthenticated
+            // localhost origin — filter their scheme so a `javascript:`/`data:`
+            // anchor can't run same-origin on click. Images don't navigate.
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
+                transformed.push(Event::Start(Tag::Link {
+                    link_type,
+                    dest_url: sanitize_link_url(&dest_url).into(),
+                    title,
+                    id,
+                }));
+            }
             other => transformed.push(other),
         }
     }
@@ -188,8 +204,40 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Wrap a rendered body fragment in a dark standalone page. Task 2 adds the
-/// highlight.js/mermaid `<link>`/`<script>` tags + init here.
+/// Neutralize dangerous URL schemes in markdown link destinations. The `/view`
+/// page is served from the unauthenticated `:8787` origin (dashboard + MCP +
+/// `/api/*`), and markdown source is untrusted agent output — a live
+/// `javascript:` / `data:` / `vbscript:` anchor would run same-origin on click.
+/// Relative URLs, fragments, and queries have no scheme and are kept; only an
+/// http/https/mailto scheme is allowed; anything else becomes `#`.
+fn sanitize_link_url(url: &str) -> String {
+    // Browsers ignore ASCII control chars when resolving a scheme
+    // (e.g. "java\tscript:"), so detect the scheme on a control-stripped copy.
+    let probe: String = url.chars().filter(|c| !c.is_ascii_control()).collect();
+    let probe = probe.trim_start();
+    let mut scheme_end = None;
+    for (i, c) in probe.char_indices() {
+        match c {
+            ':' => {
+                scheme_end = Some(i);
+                break;
+            }
+            '/' | '?' | '#' => break, // relative path / query / fragment — no scheme
+            c if c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.' => {}
+            _ => break,
+        }
+    }
+    if let Some(end) = scheme_end {
+        let scheme = probe[..end].to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https" | "mailto") {
+            return "#".to_string();
+        }
+    }
+    url.to_string()
+}
+
+/// Wrap a rendered body fragment in a dark standalone page with the
+/// highlight.js + mermaid assets and init.
 fn render_page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n\

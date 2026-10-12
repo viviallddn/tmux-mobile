@@ -138,4 +138,98 @@ mod tests {
         println!("✅ Scrollback capture works");
         cleanup();
     }
+
+    #[test]
+    fn view_rejects_path_traversal() {
+        let dir = std::env::temp_dir().join("tmm_view_trav");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = dir.to_str().unwrap();
+        let r = tmux_mobile::team_view::render_markdown_file(ws, "../../../etc/passwd");
+        assert_eq!(r.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn view_rejects_non_markdown() {
+        let dir = std::env::temp_dir().join("tmm_view_ext");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), "nope").unwrap();
+        let ws = dir.to_str().unwrap();
+        let r = tmux_mobile::team_view::render_markdown_file(ws, "secret.txt");
+        assert_eq!(r.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn view_renders_markdown_with_fences() {
+        let dir = std::env::temp_dir().join("tmm_view_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = "# Title\n\n```rust\nfn main() {}\n```\n\n```mermaid\ngraph TD; A-->B;\n```\n";
+        std::fs::write(dir.join("report.md"), md).unwrap();
+        let ws = dir.to_str().unwrap();
+        let html = tmux_mobile::team_view::render_markdown_file(ws, "report.md").unwrap();
+        assert!(html.contains("<h1>Title</h1>"));
+        assert!(html.contains("<pre class=\"mermaid\">"));
+        assert!(html.contains("language-rust"));
+        assert!(html.contains("A--&gt;B")); // mermaid source is html-escaped
+    }
+
+    #[test]
+    fn markdown_plain_fence_has_no_language_class() {
+        let html = tmux_mobile::team_view::markdown_to_html("```\nplain\n```\n");
+        assert!(html.contains("<pre><code>plain"));
+        assert!(!html.contains("language-"));
+    }
+
+    #[test]
+    fn view_asset_lookup_known_and_unknown() {
+        let (js, ct) = tmux_mobile::team_view::asset_lookup("mermaid.min.js").unwrap();
+        assert!(!js.is_empty());
+        assert!(ct.contains("javascript"));
+        assert!(tmux_mobile::team_view::asset_lookup("../secret").is_none());
+    }
+
+    #[test]
+    fn view_page_links_assets() {
+        let dir = std::env::temp_dir().join("tmm_view_assets");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.md"), "# Hi\n").unwrap();
+        let ws = dir.to_str().unwrap();
+        let html = tmux_mobile::team_view::render_markdown_file(ws, "p.md").unwrap();
+        assert!(html.contains("/view/assets/github-dark.min.css"));
+        assert!(html.contains("/view/assets/highlight.min.js"));
+        assert!(html.contains("/view/assets/mermaid.min.js"));
+        assert!(html.contains("securityLevel:'strict'"));
+    }
+
+    #[test]
+    fn view_escapes_raw_html_in_source() {
+        let html = tmux_mobile::team_view::markdown_to_html(
+            "Hello\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n",
+        );
+        // Raw source HTML is escaped to inert text, so no live <script> or
+        // <img onerror=…> element ever reaches the page. Escaping only
+        // neutralises `<`/`>`, so the inert text still contains the literal
+        // "onerror=alert" substring — assert on the live tag, not the
+        // substring, to prove the handler can never fire.
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("<img"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&lt;img src=x onerror=alert(2)&gt;"));
+    }
+
+    #[test]
+    fn view_sanitizes_dangerous_link_schemes() {
+        let html = tmux_mobile::team_view::markdown_to_html(
+            "[x](javascript:alert(1)) [u](JavaScript:alert(2)) [v](vbscript:msgbox) \
+[f](file:///etc/passwd) [y](HTTP://ok/a.md) [z](./rel.md) [w](data:text/html,blah) [m](mailto:a@b.c)\n",
+        );
+        // dangerous schemes neutralized (case-insensitively)
+        assert!(!html.to_ascii_lowercase().contains("javascript:"));
+        assert!(!html.to_ascii_lowercase().contains("vbscript:"));
+        assert!(!html.contains("file:"));
+        assert!(!html.contains("data:text/html"));
+        // safe schemes / relative / mailto preserved
+        assert!(html.contains("href=\"HTTP://ok/a.md\""));
+        assert!(html.contains("href=\"./rel.md\""));
+        assert!(html.contains("href=\"mailto:a@b.c\""));
+    }
 }

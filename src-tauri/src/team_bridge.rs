@@ -113,10 +113,21 @@ impl TeamManager {
                 db, bind
             );
             let provider: Arc<dyn BusProvider> = me.clone();
+            let view_mgr = me.clone();
             let bind = bind.to_string();
             tokio::spawn(async move {
-                if let Err(e) = agora::web::serve(provider, &bind).await {
-                    eprintln!("⚠️  team daemon not listening on {}: {}", bind, e);
+                // Host-owned Markdown viewer (`/view`) merged onto agora's
+                // router, so the vendored crate stays an untouched upstream
+                // copy. `agora::web::router` is already `pub`.
+                let app = agora::web::router(provider)
+                    .merge(crate::team_view::router(view_mgr));
+                match tokio::net::TcpListener::bind(&bind).await {
+                    Ok(listener) => {
+                        if let Err(e) = axum::serve(listener, app).await {
+                            eprintln!("⚠️  team daemon stopped on {}: {}", bind, e);
+                        }
+                    }
+                    Err(e) => eprintln!("⚠️  team daemon not listening on {}: {}", bind, e),
                 }
             });
         }
@@ -355,6 +366,18 @@ impl TeamManager {
     /// Bus for a known room (no creation). None if the room isn't registered.
     fn room_bus(&self, room: &str) -> Option<Bus> {
         self.teams.lock().unwrap().get(room).map(|t| t.bus.clone())
+    }
+
+    /// The absolute workspace dir for a known room, if any. Lets the desktop
+    /// Markdown viewer (`team_view`) scope file reads to a team's workspace —
+    /// `team_view` lives in a sibling module and can't see the private field.
+    pub(crate) fn workspace_for_room(&self, room: &str) -> Option<String> {
+        self.teams
+            .lock()
+            .unwrap()
+            .get(room)
+            .map(|t| t.workspace.clone())
+            .filter(|w| !w.is_empty())
     }
 
     fn next_clone_room(&self, source_room: &str) -> String {
@@ -742,6 +765,10 @@ impl TeamBridge for TeamManager {
 
     fn recent_workspaces(&self) -> serde_json::Value {
         serde_json::json!({ "recent_workspaces": self.load_recent_workspaces() })
+    }
+
+    fn view_base(&self) -> String {
+        self.cfg.url.clone()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<String> {

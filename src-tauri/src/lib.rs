@@ -9,6 +9,8 @@ pub mod tmux;
 pub mod team;
 #[cfg(all(desktop, not(any(target_os = "android", target_os = "ios"))))]
 pub mod team_bridge;
+#[cfg(all(desktop, not(any(target_os = "android", target_os = "ios"))))]
+pub mod team_view;
 
 #[cfg(desktop)]
 use config::Config;

@@ -91,6 +91,7 @@
   // the one in view. All chat data is scoped to activeRoom; pushes are filtered
   // by their message's room. `newTeam` toggles the start-a-new-team panel.
   let teams = $state([]);        // [{ room, workspace, session, started, agents }]
+  let viewBase = $state('');     // base URL of the local /view markdown service
   let recentWorkspaces = $state([]); // [{ workspace, template, room, last_started }]
   let activeRoom = $state('');   // '' = none selected yet
   let newTeam = $state(false);   // true = showing the "new team" workspace picker
@@ -200,6 +201,7 @@
   async function refreshTeams() {
     const s = await teamStatus();
     teams = s?.teams || [];
+    viewBase = s?.view_base || '';
     recentWorkspaces = s?.recent_workspaces || [];
     templates = s?.templates || [];
     systemPrompt = s?.system_prompt || '';
@@ -254,6 +256,7 @@
     try {
       const s = await teamStatus();
       teams = s?.teams || [];
+      viewBase = s?.view_base || '';
       recentWorkspaces = s?.recent_workspaces || [];
       available = true;
       if (!teams.some(x => x.room === activeRoom)) activeRoom = teams[0]?.room || '';
@@ -743,10 +746,71 @@
     }
   }
 
+  // Turn workspace-relative .md references in rendered chat into links to the
+  // local /view service, so clicking opens the markdown viewer in a new system
+  // browser window (via App's global a[href] handler). Two kinds:
+  //   1. anchors marked up as [text](path.md)
+  //   2. bare paths typed in prose (agents often just say ./report.md)
+  // Absolute URLs and non-.md refs are left untouched. DOM pass (not a string
+  // rewrite) so the renderMarkdown memo cache stays valid across team switches.
+  const _MD_BARE = /(?<![\w/@.-])((?:\.\/)?(?:[\w.-]+\/)*[\w.-]+\.md)(#[\w-]+)?(?![\w/.-])/g;
+  function mdViewHref(room, rel) {
+    const clean = rel.replace(/^\.\//, '');
+    return `${viewBase}/view?room=${encodeURIComponent(room)}&path=${encodeURIComponent(clean)}`;
+  }
+  function isLocalMd(href) {
+    return !!href
+      && !/^(https?:|mailto:|data:|#)/i.test(href)
+      && /\.md(#[\w-]+)?$/i.test(href);
+  }
+  function resolveMessageLinks() {
+    if (!listEl || !viewBase || !activeRoom) return;
+    const room = activeRoom;
+    // 1. Rewrite existing markdown-link anchors that point at a local .md.
+    for (const a of listEl.querySelectorAll('.msg-body a[href]')) {
+      if (a.dataset.tmmLink === '1') continue;
+      const href = a.getAttribute('href') || '';
+      if (isLocalMd(href)) {
+        a.setAttribute('href', mdViewHref(room, href.replace(/#.*$/, '')));
+      }
+      a.dataset.tmmLink = '1';
+    }
+    // 2. Linkify bare .md paths in text nodes not already inside an anchor.
+    for (const body of listEl.querySelectorAll('.msg-body')) {
+      if (body.dataset.tmmBare === '1') continue;
+      body.dataset.tmmBare = '1';
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      const targets = [];
+      let n;
+      while ((n = walker.nextNode())) {
+        if (n.parentElement && n.parentElement.closest('a,code,pre')) continue;
+        if (_MD_BARE.test(n.nodeValue || '')) targets.push(n);
+      }
+      for (const node of targets) {
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        const text = node.nodeValue;
+        _MD_BARE.lastIndex = 0;
+        let m;
+        while ((m = _MD_BARE.exec(text))) {
+          if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+          const a = document.createElement('a');
+          a.setAttribute('href', mdViewHref(room, m[1]));
+          a.textContent = m[0];
+          frag.appendChild(a);
+          last = m.index + m[0].length;
+        }
+        if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+        node.parentNode.replaceChild(frag, node);
+      }
+    }
+  }
+
   $effect(() => {
     messages;
     activeTeam?.workspace;
-    setTimeout(resolveMessageImages, 50);
+    viewBase;
+    setTimeout(() => { resolveMessageImages(); resolveMessageLinks(); }, 50);
   });
 </script>
 

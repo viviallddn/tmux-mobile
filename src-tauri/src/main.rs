@@ -138,4 +138,44 @@ mod tests {
         println!("✅ Scrollback capture works");
         cleanup();
     }
+
+    #[test]
+    fn view_rejects_path_traversal() {
+        let dir = std::env::temp_dir().join("tmm_view_trav");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = dir.to_str().unwrap();
+        let r = tmux_mobile::team_view::render_markdown_file(ws, "../../../etc/passwd");
+        assert_eq!(r.unwrap_err(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn view_rejects_non_markdown() {
+        let dir = std::env::temp_dir().join("tmm_view_ext");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), "nope").unwrap();
+        let ws = dir.to_str().unwrap();
+        let r = tmux_mobile::team_view::render_markdown_file(ws, "secret.txt");
+        assert_eq!(r.unwrap_err(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn view_renders_markdown_with_fences() {
+        let dir = std::env::temp_dir().join("tmm_view_ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = "# Title\n\n```rust\nfn main() {}\n```\n\n```mermaid\ngraph TD; A-->B;\n```\n";
+        std::fs::write(dir.join("report.md"), md).unwrap();
+        let ws = dir.to_str().unwrap();
+        let html = tmux_mobile::team_view::render_markdown_file(ws, "report.md").unwrap();
+        assert!(html.contains("<h1>Title</h1>"));
+        assert!(html.contains("<pre class=\"mermaid\">"));
+        assert!(html.contains("language-rust"));
+        assert!(html.contains("A--&gt;B")); // mermaid source is html-escaped
+    }
+
+    #[test]
+    fn markdown_plain_fence_has_no_language_class() {
+        let html = tmux_mobile::team_view::markdown_to_html("```\nplain\n```\n");
+        assert!(html.contains("<pre><code>plain"));
+        assert!(!html.contains("language-"));
+    }
 }
